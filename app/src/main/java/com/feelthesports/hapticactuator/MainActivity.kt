@@ -19,10 +19,12 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -47,6 +49,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private const val TAG = "MainActivity"
+private const val PREFS_NAME = "haptic_settings"
+private const val KEY_STRENGTH = "strength_scale"
+private const val KEY_MIN_INTENSITY = "min_intensity"
 
 sealed class ConnectionStatus {
     object Searching : ConnectionStatus()
@@ -63,9 +68,11 @@ class MainActivity : ComponentActivity() {
     private var syncChannel: SyncChannel? = null
     private var currentTimeline: Timeline? = null
     private var connectionStatus: ConnectionStatus by mutableStateOf(ConnectionStatus.Searching)
-    private var eventCount: Int?     by mutableStateOf(null)
-    private var clockOffsetMs: Long? by mutableStateOf(null)
+    private var eventCount: Int?      by mutableStateOf(null)
+    private var clockOffsetMs: Long?  by mutableStateOf(null)
     private var lastSyncMediaT: Double? by mutableStateOf(null)
+    private var strengthScale: Float  by mutableFloatStateOf(1.0f)
+    private var minIntensity: Float   by mutableFloatStateOf(0.15f)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -75,6 +82,12 @@ class MainActivity : ComponentActivity() {
         val hapticPlayer = HapticPlayer(this, capabilities)
         val powerManager = getSystemService(PowerManager::class.java)
         scheduler = Scheduler(hapticPlayer)
+
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        strengthScale = prefs.getFloat(KEY_STRENGTH, 1.0f)
+        minIntensity  = prefs.getFloat(KEY_MIN_INTENSITY, 0.15f)
+        scheduler.strengthScale = strengthScale
+        scheduler.minIntensity  = minIntensity
 
         discovery = Discovery(this).apply {
             onServiceResolved = { host, port, name ->
@@ -172,18 +185,30 @@ class MainActivity : ComponentActivity() {
                 KeepScreenOn()
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     MainScreen(
-                        capabilities   = capabilities,
-                        isPowerSaveMode = powerManager.isPowerSaveMode,
+                        capabilities     = capabilities,
+                        isPowerSaveMode  = powerManager.isPowerSaveMode,
                         connectionStatus = connectionStatus,
-                        eventCount     = eventCount,
-                        clockOffsetMs  = clockOffsetMs,
-                        lastSyncMediaT = lastSyncMediaT,
-                        onTestVibration = { type -> hapticPlayer.play(type, 0.8f) },
-                        onTestTimeline  = {
+                        eventCount       = eventCount,
+                        clockOffsetMs    = clockOffsetMs,
+                        lastSyncMediaT   = lastSyncMediaT,
+                        strengthScale    = strengthScale,
+                        minIntensity     = minIntensity,
+                        onTestVibration  = { type -> hapticPlayer.play(type, 0.8f) },
+                        onTestTimeline   = {
                             val t = Timeline.createTest()
                             eventCount = t.events.size
                             val testClock = MediaClock().apply { play(0.0) }
                             scheduler.start(t, lifecycleScope, testClock)
+                        },
+                        onStrengthScaleChange = { v ->
+                            strengthScale = v
+                            scheduler.strengthScale = v
+                            prefs.edit().putFloat(KEY_STRENGTH, v).apply()
+                        },
+                        onMinIntensityChange  = { v ->
+                            minIntensity = v
+                            scheduler.minIntensity = v
+                            prefs.edit().putFloat(KEY_MIN_INTENSITY, v).apply()
                         },
                         modifier = Modifier.padding(innerPadding),
                     )
@@ -224,8 +249,12 @@ fun MainScreen(
     eventCount: Int?,
     clockOffsetMs: Long?,
     lastSyncMediaT: Double?,
+    strengthScale: Float,
+    minIntensity: Float,
     onTestVibration: (type: String) -> Unit,
     onTestTimeline: () -> Unit,
+    onStrengthScaleChange: (Float) -> Unit,
+    onMinIntensityChange: (Float) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -316,6 +345,24 @@ fun MainScreen(
                 else -> "UDP sync:  last media_t = ${"%.2f".format(lastSyncMediaT)} s"
             },
             style = diagStyle, color = diagColor,
+        )
+
+        HorizontalDivider()
+
+        Text("Haptic strength:  ${"%.2f".format(strengthScale)}×", style = MaterialTheme.typography.titleSmall)
+        Slider(
+            value = strengthScale,
+            onValueChange = onStrengthScaleChange,
+            valueRange = 0.5f..1.5f,
+            modifier = Modifier.fillMaxWidth(),
+        )
+
+        Text("Min intensity:  ${"%.2f".format(minIntensity)}", style = MaterialTheme.typography.titleSmall)
+        Slider(
+            value = minIntensity,
+            onValueChange = onMinIntensityChange,
+            valueRange = 0f..0.5f,
+            modifier = Modifier.fillMaxWidth(),
         )
 
         HorizontalDivider()
