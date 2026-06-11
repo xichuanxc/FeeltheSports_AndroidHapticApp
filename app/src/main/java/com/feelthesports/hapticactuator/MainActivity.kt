@@ -61,6 +61,7 @@ class MainActivity : ComponentActivity() {
     private val mediaClock = MediaClock()
     private var controlChannel: ControlChannel? = null
     private var syncChannel: SyncChannel? = null
+    private var currentTimeline: Timeline? = null
     private var connectionStatus: ConnectionStatus by mutableStateOf(ConnectionStatus.Searching)
     private var eventCount: Int?     by mutableStateOf(null)
     private var clockOffsetMs: Long? by mutableStateOf(null)
@@ -111,18 +112,40 @@ class MainActivity : ComponentActivity() {
                     ch.onTimeResp = { t0, ts, t1 -> clockSync.onTimeResp(t0, ts, t1) }
                     ch.onTimeline = { data ->
                         val timeline = Timeline.parse(data)
+                        currentTimeline = timeline
                         eventCount = timeline.events.size
                         Log.d(TAG, "Timeline loaded: ${timeline.events.size} events")
                         mediaClock.play(timeline.events.firstOrNull()?.time ?: 0.0)
                         scheduler.start(timeline, lifecycleScope, mediaClock)
                     }
-                    ch.onPlay  = { t -> Log.d(TAG, "play  media_t=$t") }
-                    ch.onPause = { t -> Log.d(TAG, "pause media_t=$t") }
-                    ch.onSeek  = { t -> Log.d(TAG, "seek  media_t=$t") }
-                    ch.onRate  = { r -> Log.d(TAG, "rate  rate=$r") }
+                    ch.onPlay  = { t ->
+                        Log.d(TAG, "play  media_t=$t")
+                        mediaClock.play(t)
+                        currentTimeline?.let { scheduler.start(it, lifecycleScope, mediaClock) }
+                    }
+                    ch.onPause = { t ->
+                        Log.d(TAG, "pause media_t=$t")
+                        mediaClock.pause(t)
+                        scheduler.stop()
+                    }
+                    ch.onSeek  = { t ->
+                        Log.d(TAG, "seek  media_t=$t")
+                        mediaClock.seek(t)
+                        if (mediaClock.isPlaying) {
+                            currentTimeline?.let { scheduler.start(it, lifecycleScope, mediaClock) }
+                        }
+                    }
+                    ch.onRate  = { r ->
+                        Log.d(TAG, "rate  rate=$r")
+                        mediaClock.setRate(r)
+                        if (mediaClock.isPlaying) {
+                            currentTimeline?.let { scheduler.start(it, lifecycleScope, mediaClock) }
+                        }
+                    }
                     ch.onDisconnected = {
                         scheduler.stop()
                         syncChannel?.close(); syncChannel = null
+                        currentTimeline = null
                         connectionStatus = ConnectionStatus.Searching
                         if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
                             discovery.start()
@@ -138,6 +161,7 @@ class MainActivity : ComponentActivity() {
                     scheduler.stop()
                     syncChannel?.close();         syncChannel    = null
                     controlChannel?.disconnect(); controlChannel = null
+                    currentTimeline = null
                     connectionStatus = ConnectionStatus.Searching
                 }
             }
