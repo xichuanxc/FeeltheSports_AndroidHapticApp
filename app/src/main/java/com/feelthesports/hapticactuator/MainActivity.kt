@@ -21,6 +21,9 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
@@ -28,9 +31,19 @@ import com.feelthesports.hapticactuator.haptic.Capabilities
 import com.feelthesports.hapticactuator.haptic.HapticCapabilities
 import com.feelthesports.hapticactuator.haptic.HapticPlayer
 import com.feelthesports.hapticactuator.haptic.HapticTier
+import com.feelthesports.hapticactuator.net.Discovery
 import com.feelthesports.hapticactuator.ui.theme.HapticActuatorTheme
 
+sealed class ConnectionStatus {
+    object Searching : ConnectionStatus()
+    data class Connected(val name: String) : ConnectionStatus()
+}
+
 class MainActivity : ComponentActivity() {
+
+    private lateinit var discovery: Discovery
+    private var connectionStatus: ConnectionStatus by mutableStateOf(ConnectionStatus.Searching)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -39,19 +52,40 @@ class MainActivity : ComponentActivity() {
         val hapticPlayer = HapticPlayer(this, capabilities)
         val powerManager = getSystemService(PowerManager::class.java)
 
+        discovery = Discovery(this).apply {
+            onServiceResolved = { _, _, name ->
+                runOnUiThread { connectionStatus = ConnectionStatus.Connected(name) }
+            }
+            onServiceLost = {
+                runOnUiThread { connectionStatus = ConnectionStatus.Searching }
+            }
+        }
+
         setContent {
             HapticActuatorTheme {
                 KeepScreenOn()
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    CapabilityScreen(
+                    MainScreen(
                         capabilities = capabilities,
                         isPowerSaveMode = powerManager.isPowerSaveMode,
+                        connectionStatus = connectionStatus,
                         onTestVibration = { type -> hapticPlayer.play(type, 0.8f) },
                         modifier = Modifier.padding(innerPadding),
                     )
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        discovery.start()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        discovery.stop()
+        connectionStatus = ConnectionStatus.Searching
     }
 }
 
@@ -65,9 +99,10 @@ private fun KeepScreenOn() {
 }
 
 @Composable
-fun CapabilityScreen(
+fun MainScreen(
     capabilities: HapticCapabilities,
     isPowerSaveMode: Boolean,
+    connectionStatus: ConnectionStatus,
     onTestVibration: (type: String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -78,6 +113,19 @@ fun CapabilityScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text("Haptic Actuator", style = MaterialTheme.typography.headlineMedium)
+
+        // Connection status
+        val statusText = when (connectionStatus) {
+            is ConnectionStatus.Searching  -> "Searching for laptop…"
+            is ConnectionStatus.Connected  -> "Connected to ${connectionStatus.name}"
+        }
+        val statusColor = when (connectionStatus) {
+            is ConnectionStatus.Searching -> MaterialTheme.colorScheme.surfaceVariant
+            is ConnectionStatus.Connected -> MaterialTheme.colorScheme.primaryContainer
+        }
+        Card(colors = CardDefaults.cardColors(containerColor = statusColor)) {
+            Text(statusText, modifier = Modifier.padding(12.dp))
+        }
 
         if (isPowerSaveMode) {
             Card(
@@ -101,14 +149,11 @@ fun CapabilityScreen(
             HapticTier.BASIC       -> "Tier 3 — Basic on/off buzz"
         }
         Text("Haptic tier:  $tierLabel", style = MaterialTheme.typography.titleMedium)
-
         Text("API level:  ${capabilities.apiLevel}")
         Text("Amplitude control:  ${if (capabilities.hasAmplitudeControl) "yes" else "no"}")
 
         val primitivesText = capabilities.supportedPrimitives
-            .takeIf { it.isNotEmpty() }
-            ?.joinToString()
-            ?: "none"
+            .takeIf { it.isNotEmpty() }?.joinToString() ?: "none"
         Text("Primitives:  $primitivesText")
 
         if (capabilities.tier == HapticTier.BASIC) {
