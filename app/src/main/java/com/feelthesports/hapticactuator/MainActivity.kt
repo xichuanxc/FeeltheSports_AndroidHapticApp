@@ -7,12 +7,16 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -22,6 +26,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import com.feelthesports.hapticactuator.haptic.Capabilities
 import com.feelthesports.hapticactuator.haptic.HapticCapabilities
+import com.feelthesports.hapticactuator.haptic.HapticPlayer
 import com.feelthesports.hapticactuator.haptic.HapticTier
 import com.feelthesports.hapticactuator.ui.theme.HapticActuatorTheme
 
@@ -31,6 +36,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         val capabilities = Capabilities.detect(this)
+        val hapticPlayer = HapticPlayer(this, capabilities)
         val powerManager = getSystemService(PowerManager::class.java)
 
         setContent {
@@ -40,6 +46,7 @@ class MainActivity : ComponentActivity() {
                     CapabilityScreen(
                         capabilities = capabilities,
                         isPowerSaveMode = powerManager.isPowerSaveMode,
+                        onTestVibration = { type -> hapticPlayer.play(type, 0.8f) },
                         modifier = Modifier.padding(innerPadding),
                     )
                 }
@@ -61,6 +68,7 @@ private fun KeepScreenOn() {
 fun CapabilityScreen(
     capabilities: HapticCapabilities,
     isPowerSaveMode: Boolean,
+    onTestVibration: (type: String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -113,6 +121,27 @@ fun CapabilityScreen(
                     text = "This device's haptic hardware is basic. Vibrations will be on/off only.",
                     modifier = Modifier.padding(12.dp),
                 )
+            }
+        }
+
+        HorizontalDivider()
+
+        Text("Test vibration (intensity 0.8):", style = MaterialTheme.typography.titleSmall)
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Button(
+                onClick = { onTestVibration("strike") },
+                modifier = Modifier.weight(1f),
+            ) {
+                Text("Strike")
+            }
+            OutlinedButton(
+                onClick = { onTestVibration("bounce") },
+                modifier = Modifier.weight(1f),
+            ) {
+                Text("Bounce")
             }
         }
     }
