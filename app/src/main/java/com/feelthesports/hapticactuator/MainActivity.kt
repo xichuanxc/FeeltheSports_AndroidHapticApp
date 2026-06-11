@@ -38,6 +38,7 @@ import com.feelthesports.hapticactuator.haptic.HapticTier
 import com.feelthesports.hapticactuator.net.ClockSync
 import com.feelthesports.hapticactuator.net.ControlChannel
 import com.feelthesports.hapticactuator.net.Discovery
+import com.feelthesports.hapticactuator.net.SyncChannel
 import com.feelthesports.hapticactuator.timeline.Scheduler
 import com.feelthesports.hapticactuator.timeline.Timeline
 import com.feelthesports.hapticactuator.ui.theme.HapticActuatorTheme
@@ -59,9 +60,11 @@ class MainActivity : ComponentActivity() {
     private lateinit var scheduler: Scheduler
     private val mediaClock = MediaClock()
     private var controlChannel: ControlChannel? = null
+    private var syncChannel: SyncChannel? = null
     private var connectionStatus: ConnectionStatus by mutableStateOf(ConnectionStatus.Searching)
-    private var eventCount: Int?  by mutableStateOf(null)
+    private var eventCount: Int?     by mutableStateOf(null)
     private var clockOffsetMs: Long? by mutableStateOf(null)
+    private var lastSyncMediaT: Double? by mutableStateOf(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -76,24 +79,36 @@ class MainActivity : ComponentActivity() {
             onServiceResolved = { host, port, name ->
                 runOnUiThread {
                     connectionStatus = ConnectionStatus.Connecting(name)
-                    clockOffsetMs = null
-                    controlChannel?.disconnect()
+                    clockOffsetMs  = null
+                    lastSyncMediaT = null
 
-                    val ch = ControlChannel(host, port, capabilities)
-                    val sync = ClockSync(ch)
+                    // Tear down any previous connection
+                    syncChannel?.close();    syncChannel    = null
+                    controlChannel?.disconnect(); controlChannel = null
+
+                    // Create UDP socket first — its port goes into the hello message
+                    val syncCh = SyncChannel().also { syncChannel = it }
+                    syncCh.onSyncPulse = { mediaT, tServerNs, rate ->
+                        mediaClock.syncAnchor(mediaT, tServerNs, rate)
+                        lastSyncMediaT = mediaT
+                    }
+                    syncCh.start(lifecycleScope)
+
+                    val ch = ControlChannel(host, port, capabilities, udpPort = syncCh.port)
+                    val clockSync = ClockSync(ch)
 
                     ch.onConnected = {
                         connectionStatus = ConnectionStatus.Connected(name)
                         lifecycleScope.launch(Dispatchers.IO) {
-                            val offset = sync.sync()
+                            val offset = clockSync.sync()
                             mediaClock.setOffset(offset)
                             withContext(Dispatchers.Main) {
                                 clockOffsetMs = offset / 1_000_000
-                                Log.d(TAG, "Clock sync complete: ${clockOffsetMs} ms offset")
+                                Log.d(TAG, "Clock sync complete: $clockOffsetMs ms offset")
                             }
                         }
                     }
-                    ch.onTimeResp = { t0, ts, t1 -> sync.onTimeResp(t0, ts, t1) }
+                    ch.onTimeResp = { t0, ts, t1 -> clockSync.onTimeResp(t0, ts, t1) }
                     ch.onTimeline = { data ->
                         val timeline = Timeline.parse(data)
                         eventCount = timeline.events.size
@@ -107,6 +122,7 @@ class MainActivity : ComponentActivity() {
                     ch.onRate  = { r -> Log.d(TAG, "rate  rate=$r") }
                     ch.onDisconnected = {
                         scheduler.stop()
+                        syncChannel?.close(); syncChannel = null
                         connectionStatus = ConnectionStatus.Searching
                         if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
                             discovery.start()
@@ -120,8 +136,8 @@ class MainActivity : ComponentActivity() {
             onServiceLost = {
                 runOnUiThread {
                     scheduler.stop()
-                    controlChannel?.disconnect()
-                    controlChannel = null
+                    syncChannel?.close();         syncChannel    = null
+                    controlChannel?.disconnect(); controlChannel = null
                     connectionStatus = ConnectionStatus.Searching
                 }
             }
@@ -132,13 +148,14 @@ class MainActivity : ComponentActivity() {
                 KeepScreenOn()
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     MainScreen(
-                        capabilities = capabilities,
+                        capabilities   = capabilities,
                         isPowerSaveMode = powerManager.isPowerSaveMode,
                         connectionStatus = connectionStatus,
-                        eventCount = eventCount,
-                        clockOffsetMs = clockOffsetMs,
+                        eventCount     = eventCount,
+                        clockOffsetMs  = clockOffsetMs,
+                        lastSyncMediaT = lastSyncMediaT,
                         onTestVibration = { type -> hapticPlayer.play(type, 0.8f) },
-                        onTestTimeline = {
+                        onTestTimeline  = {
                             val t = Timeline.createTest()
                             eventCount = t.events.size
                             val testClock = MediaClock().apply { play(0.0) }
@@ -159,9 +176,9 @@ class MainActivity : ComponentActivity() {
     override fun onPause() {
         super.onPause()
         scheduler.stop()
+        syncChannel?.close();         syncChannel    = null
         discovery.stop()
-        controlChannel?.disconnect()
-        controlChannel = null
+        controlChannel?.disconnect(); controlChannel = null
         connectionStatus = ConnectionStatus.Searching
     }
 }
@@ -182,6 +199,7 @@ fun MainScreen(
     connectionStatus: ConnectionStatus,
     eventCount: Int?,
     clockOffsetMs: Long?,
+    lastSyncMediaT: Double?,
     onTestVibration: (type: String) -> Unit,
     onTestTimeline: () -> Unit,
     modifier: Modifier = Modifier,
@@ -252,21 +270,28 @@ fun MainScreen(
 
         HorizontalDivider()
 
+        val diagColor = MaterialTheme.colorScheme.onSurfaceVariant
+        val diagStyle = MaterialTheme.typography.bodySmall
         Text(
             text = when (clockOffsetMs) {
-                null -> "Clock sync: pending"
-                else -> "Clock sync: ${clockOffsetMs} ms offset"
+                null -> "Clock sync:  pending"
+                else -> "Clock sync:  $clockOffsetMs ms offset"
             },
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = diagStyle, color = diagColor,
         )
         Text(
             text = when (eventCount) {
-                null -> "Timeline: none loaded"
-                else -> "Timeline: $eventCount events"
+                null -> "Timeline:  none loaded"
+                else -> "Timeline:  $eventCount events"
             },
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = diagStyle, color = diagColor,
+        )
+        Text(
+            text = when (lastSyncMediaT) {
+                null -> "UDP sync:  none received"
+                else -> "UDP sync:  last media_t = ${"%.2f".format(lastSyncMediaT)} s"
+            },
+            style = diagStyle, color = diagColor,
         )
 
         HorizontalDivider()
