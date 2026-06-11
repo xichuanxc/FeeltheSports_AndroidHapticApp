@@ -2,6 +2,7 @@ package com.feelthesports.hapticactuator
 
 import android.os.Bundle
 import android.os.PowerManager
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -27,21 +28,28 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
 import com.feelthesports.hapticactuator.haptic.Capabilities
 import com.feelthesports.hapticactuator.haptic.HapticCapabilities
 import com.feelthesports.hapticactuator.haptic.HapticPlayer
 import com.feelthesports.hapticactuator.haptic.HapticTier
+import com.feelthesports.hapticactuator.net.ControlChannel
 import com.feelthesports.hapticactuator.net.Discovery
 import com.feelthesports.hapticactuator.ui.theme.HapticActuatorTheme
 
+private const val TAG = "MainActivity"
+
 sealed class ConnectionStatus {
     object Searching : ConnectionStatus()
+    data class Connecting(val name: String) : ConnectionStatus()
     data class Connected(val name: String) : ConnectionStatus()
 }
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var discovery: Discovery
+    private var controlChannel: ControlChannel? = null
     private var connectionStatus: ConnectionStatus by mutableStateOf(ConnectionStatus.Searching)
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -53,11 +61,36 @@ class MainActivity : ComponentActivity() {
         val powerManager = getSystemService(PowerManager::class.java)
 
         discovery = Discovery(this).apply {
-            onServiceResolved = { _, _, name ->
-                runOnUiThread { connectionStatus = ConnectionStatus.Connected(name) }
+            onServiceResolved = { host, port, name ->
+                runOnUiThread {
+                    connectionStatus = ConnectionStatus.Connecting(name)
+                    controlChannel?.disconnect()
+                    controlChannel = ControlChannel(host, port, capabilities).apply {
+                        onConnected = {
+                            connectionStatus = ConnectionStatus.Connected(name)
+                        }
+                        onTimeline = { data ->
+                            Log.d(TAG, "Timeline received: ${data.optJSONArray("events")?.length() ?: 0} events")
+                        }
+                        onPlay  = { t -> Log.d(TAG, "play  media_t=$t") }
+                        onPause = { t -> Log.d(TAG, "pause media_t=$t") }
+                        onSeek  = { t -> Log.d(TAG, "seek  media_t=$t") }
+                        onRate  = { r -> Log.d(TAG, "rate  rate=$r") }
+                        onDisconnected = {
+                            connectionStatus = ConnectionStatus.Searching
+                            if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                                discovery.start()
+                            }
+                        }
+                    }.also { it.connect(lifecycleScope) }
+                }
             }
             onServiceLost = {
-                runOnUiThread { connectionStatus = ConnectionStatus.Searching }
+                runOnUiThread {
+                    controlChannel?.disconnect()
+                    controlChannel = null
+                    connectionStatus = ConnectionStatus.Searching
+                }
             }
         }
 
@@ -85,6 +118,8 @@ class MainActivity : ComponentActivity() {
     override fun onPause() {
         super.onPause()
         discovery.stop()
+        controlChannel?.disconnect()
+        controlChannel = null
         connectionStatus = ConnectionStatus.Searching
     }
 }
@@ -114,14 +149,15 @@ fun MainScreen(
     ) {
         Text("Haptic Actuator", style = MaterialTheme.typography.headlineMedium)
 
-        // Connection status
         val statusText = when (connectionStatus) {
             is ConnectionStatus.Searching  -> "Searching for laptop…"
+            is ConnectionStatus.Connecting -> "Connecting to ${connectionStatus.name}…"
             is ConnectionStatus.Connected  -> "Connected to ${connectionStatus.name}"
         }
         val statusColor = when (connectionStatus) {
-            is ConnectionStatus.Searching -> MaterialTheme.colorScheme.surfaceVariant
-            is ConnectionStatus.Connected -> MaterialTheme.colorScheme.primaryContainer
+            is ConnectionStatus.Searching  -> MaterialTheme.colorScheme.surfaceVariant
+            is ConnectionStatus.Connecting -> MaterialTheme.colorScheme.secondaryContainer
+            is ConnectionStatus.Connected  -> MaterialTheme.colorScheme.primaryContainer
         }
         Card(colors = CardDefaults.cardColors(containerColor = statusColor)) {
             Text(statusText, modifier = Modifier.padding(12.dp))
