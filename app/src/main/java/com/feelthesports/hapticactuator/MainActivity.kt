@@ -30,15 +30,20 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import com.feelthesports.hapticactuator.clock.MediaClock
 import com.feelthesports.hapticactuator.haptic.Capabilities
 import com.feelthesports.hapticactuator.haptic.HapticCapabilities
 import com.feelthesports.hapticactuator.haptic.HapticPlayer
 import com.feelthesports.hapticactuator.haptic.HapticTier
+import com.feelthesports.hapticactuator.net.ClockSync
 import com.feelthesports.hapticactuator.net.ControlChannel
 import com.feelthesports.hapticactuator.net.Discovery
 import com.feelthesports.hapticactuator.timeline.Scheduler
 import com.feelthesports.hapticactuator.timeline.Timeline
 import com.feelthesports.hapticactuator.ui.theme.HapticActuatorTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val TAG = "MainActivity"
 
@@ -52,9 +57,11 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var discovery: Discovery
     private lateinit var scheduler: Scheduler
+    private val mediaClock = MediaClock()
     private var controlChannel: ControlChannel? = null
     private var connectionStatus: ConnectionStatus by mutableStateOf(ConnectionStatus.Searching)
-    private var eventCount: Int? by mutableStateOf(null)
+    private var eventCount: Int?  by mutableStateOf(null)
+    private var clockOffsetMs: Long? by mutableStateOf(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -69,29 +76,45 @@ class MainActivity : ComponentActivity() {
             onServiceResolved = { host, port, name ->
                 runOnUiThread {
                     connectionStatus = ConnectionStatus.Connecting(name)
+                    clockOffsetMs = null
                     controlChannel?.disconnect()
-                    controlChannel = ControlChannel(host, port, capabilities).apply {
-                        onConnected = {
-                            connectionStatus = ConnectionStatus.Connected(name)
-                        }
-                        onTimeline = { data ->
-                            val timeline = Timeline.parse(data)
-                            eventCount = timeline.events.size
-                            Log.d(TAG, "Timeline loaded: ${timeline.events.size} events")
-                            scheduler.start(timeline, lifecycleScope)
-                        }
-                        onPlay  = { t -> Log.d(TAG, "play  media_t=$t") }
-                        onPause = { t -> Log.d(TAG, "pause media_t=$t") }
-                        onSeek  = { t -> Log.d(TAG, "seek  media_t=$t") }
-                        onRate  = { r -> Log.d(TAG, "rate  rate=$r") }
-                        onDisconnected = {
-                            scheduler.stop()
-                            connectionStatus = ConnectionStatus.Searching
-                            if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
-                                discovery.start()
+
+                    val ch = ControlChannel(host, port, capabilities)
+                    val sync = ClockSync(ch)
+
+                    ch.onConnected = {
+                        connectionStatus = ConnectionStatus.Connected(name)
+                        lifecycleScope.launch(Dispatchers.IO) {
+                            val offset = sync.sync()
+                            mediaClock.setOffset(offset)
+                            withContext(Dispatchers.Main) {
+                                clockOffsetMs = offset / 1_000_000
+                                Log.d(TAG, "Clock sync complete: ${clockOffsetMs} ms offset")
                             }
                         }
-                    }.also { it.connect(lifecycleScope) }
+                    }
+                    ch.onTimeResp = { t0, ts, t1 -> sync.onTimeResp(t0, ts, t1) }
+                    ch.onTimeline = { data ->
+                        val timeline = Timeline.parse(data)
+                        eventCount = timeline.events.size
+                        Log.d(TAG, "Timeline loaded: ${timeline.events.size} events")
+                        mediaClock.play(timeline.events.firstOrNull()?.time ?: 0.0)
+                        scheduler.start(timeline, lifecycleScope, mediaClock)
+                    }
+                    ch.onPlay  = { t -> Log.d(TAG, "play  media_t=$t") }
+                    ch.onPause = { t -> Log.d(TAG, "pause media_t=$t") }
+                    ch.onSeek  = { t -> Log.d(TAG, "seek  media_t=$t") }
+                    ch.onRate  = { r -> Log.d(TAG, "rate  rate=$r") }
+                    ch.onDisconnected = {
+                        scheduler.stop()
+                        connectionStatus = ConnectionStatus.Searching
+                        if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                            discovery.start()
+                        }
+                    }
+
+                    ch.connect(lifecycleScope)
+                    controlChannel = ch
                 }
             }
             onServiceLost = {
@@ -113,11 +136,13 @@ class MainActivity : ComponentActivity() {
                         isPowerSaveMode = powerManager.isPowerSaveMode,
                         connectionStatus = connectionStatus,
                         eventCount = eventCount,
+                        clockOffsetMs = clockOffsetMs,
                         onTestVibration = { type -> hapticPlayer.play(type, 0.8f) },
                         onTestTimeline = {
                             val t = Timeline.createTest()
                             eventCount = t.events.size
-                            scheduler.start(t, lifecycleScope)
+                            val testClock = MediaClock().apply { play(0.0) }
+                            scheduler.start(t, lifecycleScope, testClock)
                         },
                         modifier = Modifier.padding(innerPadding),
                     )
@@ -156,6 +181,7 @@ fun MainScreen(
     isPowerSaveMode: Boolean,
     connectionStatus: ConnectionStatus,
     eventCount: Int?,
+    clockOffsetMs: Long?,
     onTestVibration: (type: String) -> Unit,
     onTestTimeline: () -> Unit,
     modifier: Modifier = Modifier,
@@ -226,11 +252,24 @@ fun MainScreen(
 
         HorizontalDivider()
 
-        val timelineLabel = when (eventCount) {
-            null -> "No timeline loaded"
-            else -> "Timeline: $eventCount events"
-        }
-        Text(timelineLabel, style = MaterialTheme.typography.titleSmall)
+        Text(
+            text = when (clockOffsetMs) {
+                null -> "Clock sync: pending"
+                else -> "Clock sync: ${clockOffsetMs} ms offset"
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = when (eventCount) {
+                null -> "Timeline: none loaded"
+                else -> "Timeline: $eventCount events"
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        HorizontalDivider()
 
         Text("Test vibration (intensity 0.8):", style = MaterialTheme.typography.titleSmall)
         Row(

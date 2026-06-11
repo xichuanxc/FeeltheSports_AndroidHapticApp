@@ -34,7 +34,7 @@ class ControlChannel(
     var onPause: ((mediaT: Double) -> Unit)? = null
     var onSeek: ((mediaT: Double) -> Unit)? = null
     var onRate: ((rate: Double) -> Unit)? = null
-    var onTimeResp: ((t0ClientNs: Long, tServerNs: Long) -> Unit)? = null
+    var onTimeResp: ((t0ClientNs: Long, tServerNs: Long, t1ClientNs: Long) -> Unit)? = null
     var onDisconnected: (() -> Unit)? = null
 
     private var socket: Socket? = null
@@ -94,8 +94,11 @@ class ControlChannel(
             "pause" -> withContext(Dispatchers.Main) { onPause?.invoke(msg.getDouble("media_t")) }
             "seek"  -> withContext(Dispatchers.Main) { onSeek?.invoke(msg.getDouble("media_t")) }
             "rate"  -> withContext(Dispatchers.Main) { onRate?.invoke(msg.getDouble("rate")) }
-            "time_resp" -> withContext(Dispatchers.Main) {
-                onTimeResp?.invoke(msg.getLong("t0_client_ns"), msg.getLong("t_server_ns"))
+            "time_resp" -> {
+                val t1 = System.nanoTime()   // capture on IO thread, before Main dispatch
+                withContext(Dispatchers.Main) {
+                    onTimeResp?.invoke(msg.getLong("t0_client_ns"), msg.getLong("t_server_ns"), t1)
+                }
             }
             else -> Log.w(TAG, "Unknown message type: $type")
         }
