@@ -131,26 +131,26 @@ class MainActivity : ComponentActivity() {
                         mediaClock.play(timeline.events.firstOrNull()?.time ?: 0.0)
                         scheduler.start(timeline, lifecycleScope, mediaClock)
                     }
-                    ch.onPlay  = { t ->
-                        Log.d(TAG, "play  media_t=$t")
-                        mediaClock.play(t)
+                    ch.onPlay  = { t, tServerNs, rate ->
+                        Log.d(TAG, "play  media_t=$t rate=$rate")
+                        mediaClock.syncAnchor(t, tServerNs, rate)
                         currentTimeline?.let { scheduler.start(it, lifecycleScope, mediaClock) }
                     }
-                    ch.onPause = { t ->
+                    ch.onPause = { t, tServerNs ->
                         Log.d(TAG, "pause media_t=$t")
-                        mediaClock.pause(t)
+                        mediaClock.syncAnchor(t, tServerNs, 0.0)
                         scheduler.stop()
                     }
-                    ch.onSeek  = { t ->
+                    ch.onSeek  = { t, tServerNs ->
                         Log.d(TAG, "seek  media_t=$t")
-                        mediaClock.seek(t)
+                        mediaClock.syncAnchor(t, tServerNs, mediaClock.rate)
                         if (mediaClock.isPlaying) {
                             currentTimeline?.let { scheduler.start(it, lifecycleScope, mediaClock) }
                         }
                     }
-                    ch.onRate  = { r ->
+                    ch.onRate  = { r, tServerNs ->
                         Log.d(TAG, "rate  rate=$r")
-                        mediaClock.setRate(r)
+                        mediaClock.syncAnchor(mediaClock.mediaTime(), tServerNs, r)
                         if (mediaClock.isPlaying) {
                             currentTimeline?.let { scheduler.start(it, lifecycleScope, mediaClock) }
                         }
@@ -193,7 +193,7 @@ class MainActivity : ComponentActivity() {
                         lastSyncMediaT   = lastSyncMediaT,
                         strengthScale    = strengthScale,
                         minIntensity     = minIntensity,
-                        onTestVibration  = { type -> hapticPlayer.play(type, 0.8f) },
+                        onTestVibration  = { visionType -> hapticPlayer.play(visionType, 0.8f) },
                         onTestTimeline   = {
                             val t = Timeline.createTest()
                             eventCount = t.events.size

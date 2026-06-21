@@ -385,31 +385,32 @@ authoritative schema:
 
 ```jsonc
 {
-  "version": 2,                    // schema version (integer)
-  "source": "match.mp4",           // informational; original media filename
-  "duration": 412.5,               // total media duration in seconds (float)
-  "sample_rate_analyzed": 22050,   // informational; analyzer audio sample rate
-
-  "calibration": {                 // informational; intensity calibration metadata
-    "pct_low": 10.0, "pct_high": 90.0,
-    "lo_db": -37.6, "hi_db": -30.9,
-    "note": "intensity is relative to THIS video's hit-loudness range"
-  },
-  "params": { /* analyzer settings used; informational, opaque */ },
+  "version": 2,        // schema version (integer)
+  "source": "match.mp4",  // original media filename (informational)
+  "duration": 412.5,   // total media duration in seconds (float)
 
   "events": [
     {
-      "time": 12.480,              // media-time in SECONDS (float, required)
-      "intensity": 0.82,           // 0.0..1.0 (float, required)
-      "type": "strike",            // "strike" | "bounce" | future types (required)
-      "db": -31.6,                 // raw loudness (float, optional)
-      "hf_ratio": 0.34,            // high-freq energy ratio (float, optional)
-      "centroid": 2480.0           // spectral centroid Hz (float, optional)
+      "time": 12.480,        // media-time in SECONDS (float, required)
+      "intensity": 0.82,     // 0.0..1.0 vibration strength (float, required)
+      "type": "hit",         // always "hit" — see §6.1 (string, required)
+      "vision_type": "strike" // refined classification — see §6.2 (string|null, optional)
     },
     ...
   ]
 }
 ```
+
+> **Minimal payload:** the server sends only the four fields above per event.
+> All research fields (`db`, `hf_ratio`, `centroid`, `flatness`, etc.) and
+> all annotation/analyzer metadata (`calibration`, `params`, `updated_at`,
+> `annotation_log`, etc.) are stripped before transmission. The server uses
+> an allowlist — any new field added in future is excluded by default unless
+> explicitly opted in.
+
+> **Pre-filtered:** the server applies all suppression rules (VAD speech
+> detection, vision confirmation) before sending. The client receives only
+> events that should produce haptic feedback — it does not need to filter.
 
 ### 6.1 Field semantics — what the client MUST honor
 
@@ -418,20 +419,51 @@ authoritative schema:
 - **`intensity`** is the calibrated 0.0–1.0 vibration strength for **this
   video**. It is **not** comparable across videos. Do not attempt to
   normalize, scale, or "correct" it across recordings.
-- **`type`** is currently one of `"strike"` or `"bounce"`. Future timelines
-  may add types like `"scrape"`. **Unknown types MUST NOT crash the client.**
-  Fall back to a default haptic pattern for unknown types.
+- **`type`** is always `"hit"` in the current pipeline. Audio onset detection
+  produces all events; `vision_type` (§6.2) carries the refined classification.
+  **Unknown `type` values MUST NOT crash the client.** Fall back to a default
+  haptic pattern for any unrecognised value.
 
 ### 6.2 Field semantics — what the client MAY use
 
-- **`db`** is the raw loudness in dB. Useful if you want to re-compute
-  intensity with a different calibration on the client. Otherwise ignore.
-- **`hf_ratio`** and **`centroid`** are acoustic features describing the
-  spectral shape of the event. Reserved for future use (e.g. selecting
-  different haptic patterns based on tone color). Ignore unless you have a
-  specific reason.
+- **`vision_type`** is the vision-refined event classification: `"strike"`,
+  `"bounce"`, or `null` (undetermined / no vision data). **This is the field
+  to switch on for haptic pattern selection** — not `type`. When present and
+  non-null, use it to choose a pattern (e.g. a sharp click for a racket
+  strike, a thud for a bounce). When null or absent, fall back to a generic
+  hit pattern.
 
-### 6.3 Sorting
+  Recommended Kotlin pattern:
+  ```kotlin
+  val pattern = when (event.visionType) {
+      "strike" -> HapticPattern.STRIKE
+      "bounce" -> HapticPattern.BOUNCE
+      else     -> HapticPattern.HIT   // null, absent, or unknown
+  }
+  ```
+
+### 6.3 Android implementation notes
+
+> **If your Android client was written against an earlier version of this
+> document**, check the following:
+>
+> - **`type` vs `vision_type`**: older versions of this doc described `type`
+>   as `"strike"` or `"bounce"`. In practice `type` has always been `"hit"`.
+>   If your code switches on `type` for haptic pattern selection, change it
+>   to switch on `vision_type` instead.
+> - **Removed fields**: `db`, `hf_ratio`, `centroid`, `calibration`,
+>   `params`, `sample_rate_analyzed` are no longer sent. Grep your client
+>   source for these strings; any reference to them can be removed.
+> - **Unknown fields**: if your JSON parser is strict (rejects unknown
+>   fields), make it lenient — the protocol can add fields in future.
+
+### 6.4 Unknown fields
+
+Future protocol versions may add new fields. **Clients MUST silently ignore
+any field they do not recognise.** This allows the protocol to evolve
+without breaking existing clients.
+
+### 6.4 Sorting
 
 The reference server sorts events by `time` before sending. The client
 SHOULD still sort defensively on receipt, since the order is not part of
@@ -482,7 +514,7 @@ T+0.251  CLIENT  RX sync        -> re-anchors media-clock
 T+0.375  SERVER  TX UDP -> {"msg":"sync","media_t":12.640,...}
 T+0.500  SERVER  TX UDP -> {"msg":"sync","media_t":12.765,...}
                                                    ...(continuing at 8 Hz)
-T+1.230  CLIENT  scheduler: event #43 (time=13.480, strike, intensity=0.82)
+T+1.230  CLIENT  scheduler: event #43 (time=13.480, type=hit, vision_type=strike, intensity=0.82)
                  deadline reached -> vibrator.vibrate(...)
 
 # --- User pauses video on laptop ---

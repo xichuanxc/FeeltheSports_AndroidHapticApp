@@ -30,10 +30,10 @@ class ControlChannel(
 ) {
     var onConnected: (() -> Unit)? = null
     var onTimeline: ((JSONObject) -> Unit)? = null
-    var onPlay: ((mediaT: Double) -> Unit)? = null
-    var onPause: ((mediaT: Double) -> Unit)? = null
-    var onSeek: ((mediaT: Double) -> Unit)? = null
-    var onRate: ((rate: Double) -> Unit)? = null
+    var onPlay: ((mediaT: Double, tServerNs: Long, rate: Double) -> Unit)? = null
+    var onPause: ((mediaT: Double, tServerNs: Long) -> Unit)? = null
+    var onSeek: ((mediaT: Double, tServerNs: Long) -> Unit)? = null
+    var onRate: ((rate: Double, tServerNs: Long) -> Unit)? = null
     var onTimeResp: ((t0ClientNs: Long, tServerNs: Long, t1ClientNs: Long) -> Unit)? = null
     var onDisconnected: (() -> Unit)? = null
 
@@ -90,10 +90,18 @@ class ControlChannel(
                 Log.d(TAG, "Timeline received: ${data.optJSONArray("events")?.length() ?: 0} events")
                 withContext(Dispatchers.Main) { onTimeline?.invoke(data) }
             }
-            "play"  -> withContext(Dispatchers.Main) { onPlay?.invoke(msg.getDouble("media_t")) }
-            "pause" -> withContext(Dispatchers.Main) { onPause?.invoke(msg.getDouble("media_t")) }
-            "seek"  -> withContext(Dispatchers.Main) { onSeek?.invoke(msg.getDouble("media_t")) }
-            "rate"  -> withContext(Dispatchers.Main) { onRate?.invoke(msg.getDouble("rate")) }
+            "play"  -> withContext(Dispatchers.Main) {
+                onPlay?.invoke(msg.getDouble("media_t"), msg.getLong("t_server_ns"), msg.getDouble("rate"))
+            }
+            "pause" -> withContext(Dispatchers.Main) {
+                onPause?.invoke(msg.getDouble("media_t"), msg.getLong("t_server_ns"))
+            }
+            "seek"  -> withContext(Dispatchers.Main) {
+                onSeek?.invoke(msg.getDouble("media_t"), msg.getLong("t_server_ns"))
+            }
+            "rate"  -> withContext(Dispatchers.Main) {
+                onRate?.invoke(msg.getDouble("rate"), msg.getLong("t_server_ns"))
+            }
             "time_resp" -> {
                 val t1 = System.nanoTime()   // capture on IO thread, before Main dispatch
                 withContext(Dispatchers.Main) {
