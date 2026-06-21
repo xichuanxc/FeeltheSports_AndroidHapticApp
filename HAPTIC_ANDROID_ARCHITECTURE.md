@@ -1,498 +1,663 @@
-# Haptic Sports Client — Android Architecture & Handoff
+# Haptic Sports Client — Android Architecture & Implementation Reference
 
-This document hands off the design for an Android app that vibrates in sync
-with tennis (and later badminton) video being watched on a laptop. The laptop
-side already exists (Python: an offline audio analyzer that produces a
-"haptic timeline" JSON, and a PySide6 video player). This Android client is
-the missing piece.
+This document describes the as-built Android implementation. It reflects the
+actual code, not the original design intent. Where design and code disagree,
+this document follows the code.
 
-The reader of this doc is an LLM coding assistant (Claude Code). It needs to
-build the Android project; this document tells it the system architecture,
-data formats, protocol, and the design decisions already made. The why is
-included where it constrains the how.
+Companion documents:
+- `HAPTIC_PROTOCOL.md` — wire protocol (authoritative for message schemas)
+- `HAPTIC_IOS_ARCHITECTURE.md` — iOS port guide using the same protocol
 
 ---
 
 ## 1. The system in one paragraph
 
 A laptop plays a tennis/badminton video using a Python (PySide6/Qt) player.
-The video has been analyzed offline: every racket strike and ball bounce was
-detected from the audio and written to a JSON "timeline" — each event has a
-timestamp, an intensity (0–1), a type (`strike` / `bounce`), and supporting
-acoustic features. When the user starts playback, an Android phone — already
-connected to the laptop over local Wi-Fi — receives that whole timeline, then
-schedules a vibration for each event at its exact moment, in sync with the
-video. The user feels the match.
+Every racket strike and ball bounce was detected offline and written to a JSON
+"timeline." When the user starts playback, an Android phone already on the
+same Wi-Fi network receives the whole timeline, then schedules a vibration for
+each event at exactly the right media-time, in sync with the video. The user
+feels the match.
 
-The phone is a **dumb actuator**. All analysis, all decisions about timing,
-all authority over the timeline lives on the laptop. The phone receives data
-and translates it into vibration.
+The phone is a **dumb actuator**. All analysis, all decisions about which
+events matter, all authority over the timeline live on the laptop. The phone
+receives data and translates it into vibration.
 
 ---
 
 ## 2. Architecture overview
 
 ```
-   ┌──────────────────────── Laptop ────────────────────────┐
-   │  Python video player (already built)                   │
-   │   ├─ loads <video>.haptic.json (the timeline)          │
-   │   ├─ plays the video                                   │
-   │   └─ runs the network server (this is what's new       │
-   │      from the laptop side; minimal additions)          │
-   └─────────────────────────────────────────────────────────┘
+   ┌──────────────────────── Laptop ─────────────────────────┐
+   │  Python video player                                     │
+   │   ├─ loads <video>.haptic.json (offline timeline)        │
+   │   ├─ plays the video                                     │
+   │   └─ haptic server: mDNS + TCP control + UDP sync       │
+   └──────────────────────────────────────────────────────────┘
                             │ Wi-Fi LAN
                             │
-   ┌──────────────────────── Phone ─────────────────────────┐
-   │  Android haptic client (THIS PROJECT)                  │
-   │   ├─ discovers laptop via NSD                          │
-   │   ├─ TCP control channel (timeline, config)            │
-   │   ├─ UDP sync pulses (clock alignment)                 │
-   │   ├─ schedules vibrations against a synced clock       │
-   │   └─ minimal UI: connection state + a couple knobs     │
-   └─────────────────────────────────────────────────────────┘
+   ┌──────────────────────── Phone ──────────────────────────┐
+   │  Android haptic client (this project)                    │
+   │   ├─ Discovery      NSD / mDNS browse for _haptics._tcp  │
+   │   ├─ ControlChannel TCP JSON channel (timeline + clock)  │
+   │   ├─ SyncChannel    UDP listener (sync pulses)           │
+   │   ├─ ClockSync      SNTP-style offset estimation         │
+   │   ├─ MediaClock     extrapolated media-time from anchor  │
+   │   ├─ Scheduler      coroutine loop firing vibrations     │
+   │   └─ HapticPlayer   tier-selected vibration execution    │
+   └──────────────────────────────────────────────────────────┘
 ```
 
-Key decisions, with the rationale that constrains the implementation:
-
-**Transport: dual TCP + UDP.** TCP carries the things that must arrive in order
-(handshake, capability report, the full timeline, pause/resume). UDP carries
-the things that must be fast and are disposable if dropped (periodic sync
-pulses giving the current media-time during playback). This split is the
-standard real-time-system pattern and the rationale is "reliability where you
-need it, speed where you don't."
-
-**Timeline is pre-loaded, then only the clock streams.** Rather than streaming
-individual event commands during playback, the laptop sends the *entire*
-haptic timeline once at startup over TCP. During playback the laptop only
-broadcasts lightweight "current media-time = X" sync pulses over UDP a few
-times per second. The phone runs the pre-loaded timeline against its own
-clock, corrected by those pulses. **Critical property:** a few dropped sync
+**Key design principle:** the timeline is pre-loaded once. During playback only
+lightweight UDP sync pulses (5–10 Hz) stream from the laptop. A few dropped
 pulses cost zero events — the phone already has all of them and coasts on its
-local clock between pulses. This is the chief robustness win of this design
-over event-streaming.
-
-**Discovery: NSD (Bonjour/mDNS).** The laptop advertises a service like
-`_haptics._tcp`; the phone browses for it and learns the IP/port
-automatically. The user never types an IP. NSD on Android is `NsdManager`.
-
-**Phone is a passive actuator.** The phone does no audio analysis, no event
-detection, no classification. It receives a timeline, schedules vibrations,
-and reports back its haptic capabilities so the laptop knows what it can do.
+local clock between pulses.
 
 ---
 
-## 3. The timeline JSON (input data format)
+## 3. Project structure
 
-The laptop sends one of these to the phone over TCP after connection. The
-phone parses it and indexes by time. Schema (v2):
+```
+app/src/main/java/com/feelthesports/hapticactuator/
+  MainActivity.kt              // Activity + Compose UI + all wiring
+  clock/
+    MediaClock.kt              // extrapolated media-time, anchor + rate model
+  haptic/
+    Capabilities.kt            // detect tier at startup (object, runs once)
+    HapticPlayer.kt            // play / playBatch per tier; BatchEvent
+  net/
+    Discovery.kt               // NsdManager wrapper for _haptics._tcp
+    ControlChannel.kt          // TCP length-prefixed JSON channel
+    SyncChannel.kt             // UDP DatagramSocket listener
+    ClockSync.kt               // SNTP-style time_req/resp exchange
+  timeline/
+    Timeline.kt                // HapticEvent data class + JSON parsing + binary index
+    Scheduler.kt               // coroutine scheduler with chunked sleep + batching
+  ui/theme/                    // Compose Material3 theme (Color, Theme, Type)
+```
+
+`net/`, `timeline/`, `clock/`, and `haptic/` have no Activity dependency and
+are independently testable. All UI lives in `MainActivity.kt`.
+
+---
+
+## 4. Timeline data format (wire, as received)
+
+The server sends a stripped-down timeline — no research fields, only what the
+client needs. Schema (v2 on the wire):
 
 ```jsonc
 {
   "version": 2,
-  "source": "match.mp4",          // informational
-  "duration": 412.5,              // total video duration, seconds
-  "sample_rate_analyzed": 22050,  // informational
-  "calibration": {
-    "pct_low": 10.0, "pct_high": 90.0,
-    "lo_db": -37.6, "hi_db": -30.9,
-    "note": "intensity is relative to THIS video's hit-loudness range"
-  },
-  "params": { /* analyzer settings used; informational */ },
+  "source": "match.mp4",
+  "duration": 412.5,
   "events": [
     {
-      "time": 12.480,             // seconds, matches laptop's media clock
-      "intensity": 0.82,          // 0.0..1.0, calibrated per video (see note)
-      "type": "strike",           // "strike" or "bounce"
-      "db": -31.6,                // raw loudness, for re-mapping if desired
-      "hf_ratio": 0.34,           // high-frequency-energy ratio (feature)
-      "centroid": 2480.0          // spectral centroid Hz (feature)
-    },
-    ...
+      "time": 12.480,        // media-time in SECONDS (float) — not milliseconds
+      "intensity": 0.82,     // 0.0..1.0, calibrated per video — do not renormalise
+      "type": "hit",         // always "hit" — switch on vision_type instead (§4.1)
+      "vision_type": "strike" // "strike", "bounce", or null — see §4.1
+    }
   ]
 }
 ```
 
-Important properties the phone code must respect:
+Fields `db`, `hf_ratio`, `centroid`, `calibration`, `params`, and
+`sample_rate_analyzed` are **stripped by the server before sending**. Remove
+any code that references them.
 
-- **`time` is in seconds** as a float; *not* milliseconds. The phone's internal
-  scheduling can use milliseconds but the wire format is seconds.
-- **`intensity` is relative to each video**, not absolute. A "0.7" in one
-  video does not mean the same dB as a "0.7" in another. This is intentional
-  — every video is calibrated to its own loudness range so it feels right
-  without per-video manual tuning. The phone should not try to "correct" or
-  re-scale it.
-- **`type` can be `strike` or `bounce`** in v2. The phone may use type to
-  select a different haptic *pattern* (e.g. crisp click for strike, soft thud
-  for bounce), but treating them as a single class is also valid. Type is not
-  guaranteed to be one of just those two in future timeline versions; an
-  unknown type should fall back to a default pattern, not crash.
-- **`hf_ratio`, `centroid`, `db`** are extra features the phone does not need
-  to use, but should preserve if it ever logs or echoes events.
+### 4.1 `vision_type` — the field to switch on
 
-The phone should sort events by `time` after loading (in case the source
-isn't strictly sorted) and build a binary-searchable index for fast "next
-event after t" lookups.
+`type` is always `"hit"`. The refined classification is in `vision_type`:
+
+| `vision_type` | Meaning | Haptic character |
+|---|---|---|
+| `"strike"` | racket hit | sharp, crisp click |
+| `"bounce"` | ball bounce | heavy, soft thud |
+| `null` | undetermined | generic hit |
+
+Switch on `vision_type`, not `type`. Crash if unknown values reach the haptic
+layer — use the `else` branch as the fallback.
+
+### 4.2 Kotlin representation
+
+```kotlin
+data class HapticEvent(
+    val time: Double,
+    val intensity: Float,
+    val visionType: String?,   // "strike", "bounce", or null
+)
+```
+
+Parse `vision_type` defensively:
+```kotlin
+visionType = if (!e.has("vision_type") || e.isNull("vision_type")) null
+             else e.getString("vision_type")
+```
+
+Sort events by `time` on receipt (the server sorts, but don't assume it).
+Build a binary-search index (`Timeline.indexFrom(t: Double)`) for fast
+"first event at or after t" lookups.
 
 ---
 
-## 4. Network protocol
+## 5. Network protocol
 
-### 4.1 Discovery
+See `HAPTIC_PROTOCOL.md` for authoritative message schemas. This section
+documents the as-built implementation decisions.
 
-The laptop registers an NSD service with type `_haptics._tcp` and a chosen
-port (e.g. 47821). The phone uses `NsdManager.discoverServices(...)` with the
-same type, then `resolveService(...)` on the matching `NsdServiceInfo` to
-get the host/port, then opens a TCP socket to that host:port.
+### 5.1 Discovery (`Discovery.kt`)
 
-On Android, the relevant pieces are:
-- `NsdManager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, listener)`
-- A `NsdManager.DiscoveryListener` whose `onServiceFound` filters by
-  service name/type, then calls `nsdManager.resolveService(...)`
-- A `NsdManager.ResolveListener` whose `onServiceResolved` yields the
-  `NsdServiceInfo` with `.host` (an `InetAddress`) and `.port`
-- **Always** call `stopServiceDiscovery(listener)` on app pause/destroy.
-  `NsdManager` is leaky if discovery is left running.
-- Resolve sometimes fails sporadically; retry once on
-  `onResolveFailed`.
-
-### 4.2 TCP control channel — messages
-
-The TCP socket is a length-prefixed JSON message stream. Each message:
-
-```
-[4-byte big-endian length N][N bytes of UTF-8 JSON]
+```kotlin
+nsdManager.discoverServices("_haptics._tcp", NsdManager.PROTOCOL_DNS_SD, listener)
 ```
 
-Length-prefixing avoids needing newline framing (timelines may contain
-newlines inside JSON). The phone reads exactly 4 bytes, decodes N, reads
-exactly N bytes, parses as JSON.
+Implementation notes:
+- `onServiceFound` posts to the main thread before calling `resolveService`.
+  Resolving directly inside `onServiceFound` fails on some devices.
+- An `AtomicBoolean(resolveInFlight)` prevents concurrent resolve calls —
+  `NsdManager` throws if a second resolve starts before the first finishes.
+- On `onResolveFailed`, one retry fires after 500 ms (`retryOnFail` flag
+  prevents infinite retry loops).
+- `onServiceLost` does **not** tear down the TCP connection. It only restarts
+  NSD browsing. The TCP connection is only closed when it actually fails
+  (see `onDisconnected`). Tearing down TCP on mDNS cache eviction causes
+  spurious disconnects when the network is perfectly healthy.
 
-Messages, identified by a `"msg"` field:
+### 5.2 TCP control channel (`ControlChannel.kt`)
 
-**Phone → Laptop on connection:**
+Frame format: 4-byte big-endian length + UTF-8 JSON body (no newline).
+
+The **TCP recv loop is the single owner of TCP reads**. Clock-sync responses
+are routed through an in-memory `Channel<Pair<Long, Long>>` in `ClockSync`,
+not by reading the socket inline. Reading from two places causes a race where
+clock-sync consumes messages intended for the recv loop.
+
+Callbacks (all dispatched to Main thread):
+```
+onConnected    ()
+onTimeline     (JSONObject)           // the data object, not the outer envelope
+onPlay         (mediaT, tServerNs, rate)
+onPause        (mediaT, tServerNs)
+onSeek         (mediaT, tServerNs)
+onRate         (rate, tServerNs)
+onTimeResp     (t0ClientNs, tServerNs, t1ClientNs)
+onDisconnected ()
+```
+
+`t_server_ns` is present in **every** control message (`play`, `pause`,
+`seek`, `rate`). Always use it — never estimate the server time from
+`System.nanoTime()` alone for anchoring.
+
+**`t1ClientNs` capture timing:** the receive timestamp `t1` for clock-sync
+must be captured **on the IO thread** at the moment of socket read, before
+dispatching to Main. Capturing it after the dispatch includes queue latency
+and inflates the measured RTT.
+
+```kotlin
+"time_resp" -> {
+    val t1 = System.nanoTime()   // on IO thread — captured here, not in onTimeResp
+    withContext(Dispatchers.Main) {
+        onTimeResp?.invoke(msg.getLong("t0_client_ns"), msg.getLong("t_server_ns"), t1)
+    }
+}
+```
+
+### 5.3 UDP sync channel (`SyncChannel.kt`)
+
+`DatagramSocket` bound to a random OS-assigned port (`socket.localPort`).
+That port is declared in `hello.udp_port` so the server knows where to send
+sync pulses.
+
+The receive loop uses a 500 ms `soTimeout` so `isActive` is checked regularly
+even when no pulses arrive. The loop exits cleanly on `SocketException`
+(socket closed) and tolerates `SocketTimeoutException` without logging.
+
+### 5.4 Clock sync (`ClockSync.kt`)
+
+SNTP-style exchange: 8 rounds, 20 ms between requests, 2 s response timeout.
+
+```
+rtt_ns    = t1ClientNs - t0ClientNs
+offset_ns = tServerNs - (t0ClientNs + rtt_ns / 2)
+```
+
+After collecting all responses: sort by RTT, keep the lowest half, average
+the offsets. Result is `clock_offset_ns` — add this to `System.nanoTime()`
+to get the server's monotonic clock.
+
+Responses are routed via a `Channel<Pair<Long, Long>>` in `ClockSync.onTimeResp`.
+This avoids the TCP race described in §5.2.
+
+---
+
+## 6. Clock model (`MediaClock.kt`)
+
+### 6.1 Fields
+
+```kotlin
+@Volatile var clockOffsetNs: Long = 0L  // set by ClockSync after handshake
+
+private data class Anchor(
+    val mediaT: Double,    // media-time at the anchor moment
+    val serverNs: Long,    // server clock at the anchor moment
+    val rate: Double,      // playback rate (0.0 = paused)
+)
+@Volatile private var anchor: Anchor? = null
+```
+
+### 6.2 `mediaTime()` — the core formula
+
+```kotlin
+fun mediaTime(): Double {
+    val a = anchor ?: return 0.0
+    if (a.rate == 0.0) return a.mediaT   // paused
+    return a.mediaT + (nowServerNs() - a.serverNs) / 1_000_000_000.0 * a.rate
+}
+
+private fun nowServerNs() = System.nanoTime() + clockOffsetNs
+```
+
+### 6.3 Anchoring methods
+
+| Method | When to use |
+|---|---|
+| `syncAnchor(mediaT, tServerNs, rate)` | Primary method — use for play, pause, seek, rate, UDP sync pulses. Uses the server's own timestamp, most accurate. |
+| `play(mediaT, rate)` | Convenience — anchors to local estimated server time. Less accurate; prefer `syncAnchor`. |
+| `pause(mediaT)` | Freezes clock at mediaT using local estimate. |
+| `seek(mediaT)` | Jumps to mediaT, preserves current rate. |
+| `setRate(rate)` | Re-anchors with new rate. |
+
+In practice, `MainActivity` uses `syncAnchor` for all incoming messages because
+every control message carries `t_server_ns`.
+
+### 6.4 `setOffset` — updating clock offset without disturbing media time
+
+Naively changing `clockOffsetNs` would shift `nowServerNs()` and therefore
+change `mediaTime()`. `setOffset` compensates by shifting `anchor.serverNs`
+by the same delta:
+
+```kotlin
+fun setOffset(offsetNs: Long) {
+    val delta = offsetNs - clockOffsetNs
+    clockOffsetNs = offsetNs
+    anchor?.let { anchor = it.copy(serverNs = it.serverNs + delta) }
+}
+```
+
+Call `setOffset` after clock sync completes. Never write `clockOffsetNs`
+directly.
+
+### 6.5 `isPlaying`
+
+```kotlin
+val isPlaying: Boolean get() = (anchor?.rate ?: 0.0) != 0.0
+```
+
+Paused = rate 0.0. There is no separate `playing` boolean.
+
+---
+
+## 7. Haptic tier detection (`Capabilities.kt`)
+
+Detected once at app start, passed everywhere as an immutable
+`HapticCapabilities` data class.
+
+```kotlin
+enum class HapticTier { COMPOSITION, AMPLITUDE, BASIC }
+
+data class HapticCapabilities(
+    val tier: HapticTier,
+    val hasAmplitudeControl: Boolean,
+    val supportedPrimitives: List<String>,   // e.g. ["CLICK", "TICK", "LOW_TICK", "THUD"]
+    val apiLevel: Int,
+)
+```
+
+Tier selection:
+```kotlin
+val tier = when {
+    supportedPrimitives.isNotEmpty() -> HapticTier.COMPOSITION   // at least one primitive works
+    hasAmplitude -> HapticTier.AMPLITUDE
+    else -> HapticTier.BASIC
+}
+```
+
+Note: `arePrimitivesSupported()` is not reliable on API 30 (returns `true`
+for everything). `minSdk = 31` avoids this. On real API 31+ devices, many
+OEM builds (e.g. Samsung budget line) return no supported primitives, so tier
+falls through to AMPLITUDE or BASIC — this is correct behavior.
+
+The four primitives checked: `CLICK`, `TICK`, `LOW_TICK`, `THUD`.
+These names are also the strings sent in `hello.capabilities.primitives`.
+
+---
+
+## 8. Haptic playback (`HapticPlayer.kt`)
+
+### 8.1 The vibration-cancellation problem
+
+Android's `Vibrator.vibrate()` **cancels any in-progress vibration** before
+starting the new one. If two haptic events are within ~200 ms of each other,
+the second `vibrate()` call cuts off the first, making both events weaker or
+making the first disappear entirely.
+
+**Fix:** collect events that fall within a 200 ms window and fire them as a
+single `VibrationEffect.Composition` call. The hardware engine handles the
+inter-event timing internally without any cancellation.
+
+### 8.2 `BatchEvent`
+
+```kotlin
+data class BatchEvent(
+    val visionType: String?,
+    val intensity: Float,
+    val delayFromFirstMs: Int,   // 0 for the first event; gap from first event for subsequent ones
+)
+```
+
+### 8.3 `playBatch(events: List<BatchEvent>)`
+
+- If tier ≠ COMPOSITION, or batch size == 1: calls `play()` for each event
+  individually (Tier 2/3 doesn't support Composition).
+- If tier == COMPOSITION and batch size > 1: builds one
+  `VibrationEffect.Composition` with all events at their respective delays.
+
+The delay passed to `addPrimitive(id, scale, delayMs)` is the **gap after
+the previous primitive ends**, not after it starts:
+
+```kotlin
+val gapMs = event.delayFromFirstMs - events[i - 1].delayFromFirstMs
+val prevDurationMs = vibrator.getPrimitiveDurations(prevId)[0]
+val delayMs = (gapMs - prevDurationMs).coerceAtLeast(0)
+composition.addPrimitive(id, event.intensity, delayMs)
+```
+
+### 8.4 `estimateBatchDurationMs`
+
+Used by the Scheduler to compute a post-batch guard delay. Returns 0 for
+non-COMPOSITION tiers (guard not needed since `playBatch` falls through to
+individual `play()` calls):
+
+```kotlin
+fun estimateBatchDurationMs(events: List<BatchEvent>): Int {
+    if (events.isEmpty() || capabilities.tier != HapticTier.COMPOSITION) return 0
+    val last = events.last()
+    return last.delayFromFirstMs + vibrator.getPrimitiveDurations(pickPrimitive(last.visionType))[0]
+}
+```
+
+### 8.5 `pickPrimitive(visionType: String?)`
+
+Maps `vision_type` to a preference-ordered list of primitives, picks the first
+one the device actually supports:
+
+```kotlin
+val prefs = when (visionType) {
+    "bounce" -> listOf("THUD", "LOW_TICK", "TICK", "CLICK")   // soft/heavy preferred
+    else     -> listOf("CLICK", "TICK", "LOW_TICK", "THUD")   // "strike", null, unknown
+}
+val name = prefs.firstOrNull { it in capabilities.supportedPrimitives }
+    ?: capabilities.supportedPrimitives.firstOrNull()
+    ?: return VibrationEffect.Composition.PRIMITIVE_CLICK      // safe fallback if empty
+return NAME_TO_ID[name] ?: VibrationEffect.Composition.PRIMITIVE_CLICK
+```
+
+If `supportedPrimitives` is empty (non-COMPOSITION device), the safe fallback
+`PRIMITIVE_CLICK` is never actually reached because `estimateBatchDurationMs`
+guards with the tier check before calling `pickPrimitive`.
+
+### 8.6 Tier 2 and 3
+
+```kotlin
+// Tier 2: amplitude-modulated one-shot
+val amplitude = (scale * 255).toInt().coerceIn(1, 255)
+vibrator.vibrate(VibrationEffect.createOneShot(30L, amplitude))
+
+// Tier 3: basic on/off buzz
+val durationMs = (20 + scale * 40).toLong()
+vibrator.vibrate(VibrationEffect.createOneShot(durationMs, VibrationEffect.DEFAULT_AMPLITUDE))
+```
+
+---
+
+## 9. Scheduler (`Scheduler.kt`)
+
+The scheduler is a single coroutine on `Dispatchers.Default`. It runs through
+the timeline event-by-event.
+
+### 9.1 Constants
+
+```kotlin
+private const val STALE_THRESHOLD_S = 0.3   // skip events more than 300 ms in the past
+private const val MAX_SLEEP_MS = 200L        // max sleep between clock re-anchors
+private const val BATCH_WINDOW_MS = 200      // collect events within 200 ms into one batch
+```
+
+### 9.2 Loop structure
+
+For each event:
+
+1. **Chunked sleep**: sleep toward the event's deadline in ≤200 ms chunks so
+   the live clock stays current between sleeps. The scheduler re-reads
+   `mediaClock.mediaTime()` on each chunk iteration, incorporating any
+   `syncAnchor` calls that arrived in the meantime.
+
+2. **Stale check**: if the event is more than 300 ms in the past when the
+   scheduler wakes up, skip it and log.
+
+3. **Intensity filter**: if `event.intensity × strengthScale < minIntensity`,
+   skip and log.
+
+4. **Look-ahead batch**: scan forward through events within `BATCH_WINDOW_MS`
+   (200 ms) of the current event. Build a `List<BatchEvent>` for them all.
+   Events that fail the intensity filter within the window are skipped but
+   the scan still continues to find events beyond them.
+
+5. **Fire**: `player.playBatch(batch)` on Main thread.
+
+6. **Post-batch guard**: wait until the estimated composition end time before
+   advancing. This prevents the next `vibrate()` call from cancelling the
+   tail of the current composition:
+   ```kotlin
+   val compositionEndsAtS = event.time + batchDurationMs / 1_000.0
+   val guardMs = ((compositionEndsAtS - mediaClock.mediaTime()) / rate * 1_000.0).toLong()
+   if (guardMs > 1L) delay(guardMs.coerceAtMost(MAX_SLEEP_MS))
+   ```
+
+7. **Advance index** to `j` (past all events consumed in the batch).
+
+### 9.3 Start / stop
+
+- `start()` cancels any running job and starts a new one from
+  `timeline.indexFrom(mediaClock.mediaTime())`.
+- Called on: `play`, `seek` (if playing), `rate` (if playing).
+- `stop()` cancels the job.
+- Called on: `pause`, `onDisconnected`, `onPause` (Activity lifecycle).
+
+---
+
+## 10. Connection and reconnection (`MainActivity.kt`)
+
+### 10.1 Connection states
+
+```kotlin
+sealed class ConnectionStatus {
+    object Searching : ConnectionStatus()
+    data class Reconnecting(val name: String) : ConnectionStatus()
+    data class Connecting(val name: String) : ConnectionStatus()
+    data class Connected(val name: String) : ConnectionStatus()
+}
+```
+
+### 10.2 `connectTo(host, port, name)`
+
+Central method called from both NSD resolution and direct reconnect attempts:
+
+1. Cancels any pending reconnect job.
+2. Sets status to `Connecting`.
+3. Closes existing `SyncChannel` and `ControlChannel`.
+4. Creates a new `SyncChannel` (binds a fresh UDP socket, gets a new port).
+5. Creates a new `ControlChannel`, wires all callbacks.
+6. Calls `ch.connect(lifecycleScope)`.
+
+The last known host/port/name is stored in `lastHost`, `lastPort`, `lastName`
+for direct reconnect.
+
+### 10.3 `scheduleReconnect()` — exponential backoff
+
+```kotlin
+private fun scheduleReconnect() {
+    discovery.start()   // NSD fallback — catches IP changes or re-advertisement
+
+    val host = lastHost ?: return   // no known address yet; NSD only
+    val delayMs = reconnectDelay
+    reconnectDelay = (reconnectDelay * 2).coerceAtMost(RECONNECT_DELAY_MAX_MS)   // doubles each time, cap 30 s
+
+    reconnectJob?.cancel()
+    reconnectJob = lifecycleScope.launch {
+        delay(delayMs)
+        if (connectionStatus is ConnectionStatus.Reconnecting ||
+            connectionStatus is ConnectionStatus.Searching) {
+            connectTo(host, lastPort, lastName)
+        }
+    }
+}
+```
+
+Dual strategy: NSD discovery runs in parallel for IP changes, while the
+direct TCP fast-path retries the last known address (succeeds in ~100 ms if
+the server is up). The first to succeed wins.
+
+### 10.4 `onResume` / `onPause`
+
+**`onResume`**: resets backoff to 1 s, restarts NSD, triggers immediate
+reconnect attempt if not already connected/connecting.
+
+**`onPause`**: cancels reconnect job, stops scheduler, closes sync/control
+channels, stops NSD. Resets status to `Searching`. The app does not hold
+connections in the background.
+
+---
+
+## 11. UI (`MainActivity.kt` — Jetpack Compose)
+
+The UI is built with Jetpack Compose + Material3. All state is held as
+Compose `mutableStateOf` / `mutableFloatStateOf` on the Activity.
+
+### 11.1 Status card
+
+Color-coded by connection state:
+- `Searching` → `surfaceVariant`
+- `Reconnecting` → `errorContainer` (red-tinted)
+- `Connecting` → `secondaryContainer`
+- `Connected` → `primaryContainer` (green-tinted)
+
+### 11.2 Diagnostics (always visible, no collapse)
+
+- Clock sync offset in ms (`null` = not yet synced)
+- Timeline event count (`null` = no timeline loaded)
+- Last UDP sync media_t in seconds (`null` = no pulse received)
+- Haptic tier label + API level + amplitude control + primitive list
+
+### 11.3 Banners
+
+- **Power Save Mode**: shown when `PowerManager.isPowerSaveMode` is true.
+  Haptics may be suppressed by the OS.
+- **Basic tier**: shown when `capabilities.tier == HapticTier.BASIC`.
+  Informs user the device only vibrates on/off.
+
+### 11.4 Controls
+
+- **Strength slider**: 0.5×–1.5×, persisted to `SharedPreferences` as
+  `strength_scale`. Applied multiplicatively to event intensity before
+  intensity filter check.
+- **Min intensity slider**: 0.0–0.5, persisted as `min_intensity`. Events
+  with `scaled intensity < minIntensity` are skipped silently.
+- **Strike / Bounce test buttons**: fires `hapticPlayer.play(visionType, 0.8f)`
+  immediately, outside the scheduler.
+- **Test Timeline button**: loads `Timeline.createTest()` (6 events over ~3 s)
+  and runs the scheduler against a fresh clock starting at t=0.
+
+### 11.5 Screen-on
+
+`view.keepScreenOn = true` is set via a Compose `DisposableEffect` that
+follows the composable lifecycle. No WakeLock is used.
+
+---
+
+## 12. `hello` message (sent on connect)
+
 ```json
-{ "msg": "hello",
+{
+  "msg": "hello",
   "client": "android-haptic",
   "client_version": "0.1",
+  "udp_port": 41665,
   "capabilities": {
-    "amplitude_control": true,        // Vibrator.hasAmplitudeControl()
-    "primitives": ["CLICK","TICK","LOW_TICK","THUD"],  // those supported
-    "vibrator_api": 31                // Build.VERSION.SDK_INT, roughly
+    "amplitude_control": true,
+    "primitives": ["CLICK", "TICK", "LOW_TICK", "THUD"],
+    "vibrator_api": 33
   }
 }
 ```
 
-**Laptop → Phone, in response (or whenever a new video is selected):**
-```json
-{ "msg": "timeline", "data": { ...the full timeline JSON above... } }
-```
-
-**Clock-sync exchange** — repeat several times right after `hello`/`timeline`:
-- Phone → Laptop:  `{"msg":"time_req","t0_client_ns":1234567890}`
-  (`t0_client_ns` = phone's `System.nanoTime()` at send)
-- Laptop → Phone:  `{"msg":"time_resp","t0_client_ns":1234567890,
-                    "t_server_ns":9876543210}`
-  (laptop fills `t_server_ns` from its own monotonic clock when received)
-- Phone records on receive: t1_client_ns = `System.nanoTime()`. Then:
-    rtt = t1_client_ns - t0_client_ns
-    offset = t_server_ns - (t0_client_ns + rtt/2)
-  Do this 5–10 times in quick succession; **discard the highest-RTT half**
-  and average the rest. Store `clock_offset_ns` for later use.
-
-**Playback control (laptop → phone):**
-```json
-{ "msg": "play",  "media_t": 12.345 }     // playback started at this media-time
-{ "msg": "pause", "media_t": 12.345 }
-{ "msg": "seek",  "media_t": 42.000 }     // jumped; clear upcoming scheduled vibrations
-{ "msg": "rate",  "rate": 0.5 }           // playback rate changed (slow-mo)
-```
-
-**Disconnection:** either side may close the TCP socket cleanly. The phone
-should treat unexpected close as "go back to discovering."
-
-### 4.3 UDP sync pulses — during playback
-
-The laptop sends short UDP datagrams to the phone's port (the phone's UDP
-port is included as `"udp_port": NNNN` in its `hello` message). Each pulse
-is plain JSON:
-
-```json
-{ "msg": "sync", "media_t": 12.345, "t_server_ns": 9876543210, "rate": 1.0 }
-```
-
-Sent at ~5–10 Hz during playback. The phone uses each pulse to:
-1. Convert `t_server_ns` to phone-local time via the clock offset.
-2. Verify that its assumed media-time isn't drifting from the laptop's.
-3. Re-anchor its local media-time clock: `media_t_at_local_time(now)` becomes
-   the source of truth for "when is each event?"
-
-The phone should **not** wait for sync pulses before scheduling. Sync pulses
-are corrections, not commands. The timeline + the initial clock-sync gives
-the phone everything it needs to schedule vibrations; sync pulses just keep
-it from drifting.
-
-If sync pulses stop arriving for > ~2 seconds, the phone may assume the
-laptop paused or disconnected. (Pause/seek messages over TCP are the
-authoritative signal, but sync-pulse silence is a useful corroboration.)
+`udp_port` is the OS-assigned port from `SyncChannel.port`.
+`primitives` is `capabilities.supportedPrimitives` — the actual list from
+`arePrimitivesSupported()`, not a hardcoded list.
 
 ---
 
-## 5. Clock model
+## 13. Known caveats and design constraints
 
-The phone maintains a function `mediaTime() -> Float (seconds)` that returns
-the current media-time as accurately as possible. The model:
-
-- After clock-sync, the phone knows `clock_offset_ns` between its monotonic
-  clock and the laptop's monotonic clock.
-- When `play` arrives with `media_t = M` and a server timestamp `S`, the
-  phone records an anchor: `(anchor_media_t = M, anchor_server_ns = S,
-  rate = 1.0)`.
-- `mediaTime()` is then computed each call as:
-    ```
-    now_server_ns = System.nanoTime() + clock_offset_ns
-    elapsed_s = (now_server_ns - anchor_server_ns) / 1e9
-    media_t = anchor_media_t + elapsed_s * rate
-    ```
-- Each incoming `sync` re-anchors the phone's anchor to the laptop's
-  authoritative `media_t` and `t_server_ns`. This corrects drift.
-- `pause` freezes by setting rate to 0 (so `mediaTime()` returns a constant).
-- `seek` clears any pending scheduled vibrations whose media_t is now in the
-  past relative to the new anchor.
-- `rate` changes update the anchor's rate, so scheduling math still works at
-  slow/fast playback.
-
-**Scheduling vibrations:** for each event with media-time `e.time`, compute
-the phone-local nanosecond time at which to fire it:
-    ```
-    delta_media_s = e.time - mediaTime()
-    fire_at_local_ns = System.nanoTime() + delta_media_s * 1e9 / rate
-    ```
-Use a `ScheduledExecutorService` (or coroutine `delay`) to fire at that
-moment. On `seek`, cancel scheduled tasks beyond a small lookahead and
-reschedule the new set.
-
-A reasonable strategy is "schedule the next ~1 second of upcoming events; on
-each sync pulse, top up to maintain the 1-second lookahead." This keeps the
-scheduler small and lets re-anchoring affect events that haven't fired yet.
+- **Haptics require foreground / screen on** on most Android devices. This is
+  not fixed; the assumed use case is the viewer holding the phone while
+  watching.
+- **Power Save Mode** suppresses haptics on many devices. Detected and
+  surfaced in the UI. No workaround.
+- **`vibrate()` cancels in-progress vibration.** Close events (< 200 ms)
+  must be batched into one `VibrationEffect.Composition` or the earlier one
+  is cut short. See §8.
+- **`arePrimitivesSupported()` is unreliable on API 30.** `minSdk = 31` avoids
+  this. Some API 31+ OEM builds report no supported primitives; the tier
+  correctly falls through to AMPLITUDE or BASIC.
+- **Scheduler jitter on `Dispatchers.Default`**: `delay()` can overshoot by
+  100–200 ms under load. The 300 ms stale threshold and chunked sleep
+  compensate. This is not fixable without a real-time thread, which Android
+  doesn't expose.
+- **NSD resolve races**: `NsdManager.resolveService()` must not be called
+  concurrently. The `AtomicBoolean(resolveInFlight)` guard prevents this.
+- **Internet connectivity not required.** This is a local-network app.
+  Remove any `ACCESS_NETWORK_STATE` or internet-related code if it appears.
 
 ---
 
-## 6. Haptics: tiered playback by device capability
+## 14. Out of scope (do not build)
 
-This is the most platform-specific part of the project, and the most
-device-dependent. The phone should detect what its vibrator can do and pick
-the best available tier.
-
-**API minimums and detection (verified against current Android docs):**
-- `VibrationEffect` (general) — API 26+ (Build.VERSION_CODES.O)
-- `VibrationEffect.createOneShot(duration, amplitude)` — API 26+, amplitude
-  0–255, requires `Vibrator.hasAmplitudeControl() == true` for the amplitude
-  to actually take effect (else amplitude is ignored).
-- `VibrationEffect.Composition` with primitives — API 30+
-  (Build.VERSION_CODES.R).
-- `Vibrator.arePrimitivesSupported(...)` returning per-primitive booleans
-  reliably — API 31+. (On API 30 the call exists but returns `true` for
-  everything regardless, which is misleading; treat API 30 as "compositions
-  may not actually work as named.")
-- `VibratorManager` (the new accessor) — API 31+. On API < 31 use the
-  deprecated `(Vibrator) context.getSystemService(Context.VIBRATOR_SERVICE)`.
-
-**Recommended minSdk: 31 (Android 12).** This gets you reliable primitive
-capability detection and a clean haptics story. minSdk 26 is possible but
-the bottom tier dominates and the experience suffers.
-
-**Three tiers, in descending preference:**
-
-**Tier 1 — Composition with primitives (API 31+, primitives supported).**
-Build a `VibrationEffect` per event type by composing primitives:
-- `strike` → e.g. `PRIMITIVE_CLICK` scaled by intensity (the sharp, crisp
-  one)
-- `bounce` → e.g. `PRIMITIVE_THUD` scaled by intensity, or `PRIMITIVE_LOW_TICK`
-- The `addPrimitive(id, scale)` `scale` parameter is 0.0–1.0 and maps
-  directly from our `intensity`.
-
-Example pseudocode:
-```kotlin
-val effect = VibrationEffect.startComposition()
-    .addPrimitive(VibrationEffect.Composition.PRIMITIVE_CLICK, intensity)
-    .compose()
-vibratorManager.defaultVibrator.vibrate(effect)
-```
-
-Check primitive support at startup:
-```kotlin
-val primitives = intArrayOf(
-    VibrationEffect.Composition.PRIMITIVE_CLICK,
-    VibrationEffect.Composition.PRIMITIVE_TICK,
-    VibrationEffect.Composition.PRIMITIVE_LOW_TICK,
-    VibrationEffect.Composition.PRIMITIVE_THUD
-)
-val supported = vibrator.arePrimitivesSupported(*primitives)
-// `supported[i]` corresponds to `primitives[i]`
-```
-
-**Tier 2 — Amplitude-modulated one-shot waveform (any amplitude-control device).**
-If `vibrator.hasAmplitudeControl()` but compositions aren't usable:
-```kotlin
-val duration = 30L  // ms; short for impact-like feel
-val amplitude = (intensity * 255).toInt().coerceIn(1, 255)
-val effect = VibrationEffect.createOneShot(duration, amplitude)
-vibrator.vibrate(effect)
-```
-
-**Tier 3 — Plain timed buzz (last-resort, no amplitude control).**
-Use `vibrator.vibrate(durationMs)` with duration proportional to intensity.
-This is buzzy and ugly; tell the user the device's haptic hardware is basic.
-
-Always require the `VIBRATE` permission in `AndroidManifest.xml`. No runtime
-permission prompt is needed for vibration on any current API.
-
-**Reported capabilities in `hello`:** include `amplitude_control` (boolean),
-the list of supported primitive names (strings, not ints), and the API level.
-The laptop doesn't currently change behavior based on this, but the data is
-useful for diagnostics and future use.
+- Phone-side audio capture or analysis
+- Playing video on the phone
+- Multi-phone broadcast mode
+- Cloud sync, accounts, telemetry beyond local logs
+- Internet connectivity
+- ML inference on the phone
 
 ---
 
-## 7. The minimum viable UI
+## 15. Quick reference
 
-Don't overbuild the UI. The phone is a haptic device, not an app to interact
-with. A minimal UI is:
-
-- **Connection status**: "Searching for laptop…" / "Connected to <name>" /
-  "Disconnected — searching again…"
-- **Playback state**: a small indicator showing playing / paused / current
-  media-time.
-- **Haptic strength scaler** (a slider): multiplies all intensities by 0.5–1.5
-  so the user can taste-tune to their device. Persist with `SharedPreferences`
-  or DataStore.
-- **Minimum intensity threshold** (a slider): below this, no vibration is
-  played (the per-video "soft strikes don't buzz" semantic we use on the
-  laptop). Default ~0.15.
-- A small diagnostics view (collapsed by default): clock offset estimate,
-  events scheduled, last sync pulse time, frame the user can read if things
-  go wrong.
-
-That's it. No browsing of timelines, no in-app video, no settings beyond the
-two sliders.
-
----
-
-## 8. Project structure (suggested)
-
-```
-app/
-  build.gradle                 // minSdk 31, vibrate permission, kotlinx-coroutines
-  src/main/
-    AndroidManifest.xml
-    java/com/example/haptic/
-      MainActivity.kt          // hosts the UI + lifecycle
-      ui/
-        ConnectionView.kt      // status + sliders + diagnostics
-      net/
-        Discovery.kt           // NsdManager wrapper
-        ControlChannel.kt      // TCP + JSON message protocol
-        SyncChannel.kt         // UDP listener loop
-        ClockSync.kt           // SNTP-style handshake
-      timeline/
-        Timeline.kt            // data class + parsing + indexed lookup
-        Scheduler.kt           // schedule vibrations against media-clock
-      haptic/
-        Capabilities.kt        // detect tier at startup, report
-        HapticPlayer.kt        // play one event according to its tier
-      clock/
-        MediaClock.kt          // mediaTime() with anchors + rate
-    res/
-      layout/, values/, ...
-```
-
-Keep `net/`, `timeline/`, and `clock/` free of Android-Activity dependencies
-where reasonable — they're plain Kotlin and unit-testable.
-
----
-
-## 9. Build it in this order
-
-The reason the project is naturally layered: each step is testable before
-the next, so failures are isolated.
-
-1. **Project skeleton + permissions + capability detection.** App launches,
-   prints capability tier to a TextView. No networking. Verifies haptic
-   detection works on the target device.
-2. **One-shot vibration on button tap.** Confirm Tier 1/2/3 actually fire
-   different feels on the device. Useful baseline before any timing.
-3. **NSD discovery.** App finds a fake laptop service (you can advertise one
-   from `dns-sd` on Mac during dev). Status updates to "Connected to <X>".
-4. **TCP control channel.** Define the message classes, implement
-   length-prefixed JSON read/write loop. Echo a `hello` and a fake `timeline`
-   message; parse and log.
-5. **Timeline + scheduler (no clock sync yet).** Schedule events relative to
-   "first event time = now" — fires vibrations as if playback started this
-   instant. Lets you feel a real timeline through the device end-to-end.
-6. **Clock sync.** Implement the SNTP-style handshake. Verify offset is in
-   the low milliseconds on a quiet LAN.
-7. **UDP sync pulses.** Receive and re-anchor the media-clock.
-8. **Play / pause / seek / rate messages.** Re-schedule on each.
-9. **UI polish** (sliders, persistence). Add reconnect logic for when the
-   laptop's app restarts.
-
-Test step 5 with a hard-coded timeline before involving the laptop. Test
-step 6/7 against a tiny standalone Python sync-server before involving the
-real laptop player. Layered tests = isolated bugs.
-
----
-
-## 10. Known caveats and design constraints to honor
-
-- **Haptics require the foreground / screen-on** on most Android devices.
-  This is not a project requirement to "fix"; the assumed use is that the
-  viewer holds the phone while watching. Just don't be surprised by it.
-- **Low Power Mode suppresses haptics.** Detect with
-  `PowerManager.isPowerSaveMode()` and surface a banner if so.
-- **Phone wakelock**: hold a partial wake lock during playback so the screen
-  staying on isn't required, OR set the window's `KEEP_SCREEN_ON` flag while
-  connected. The latter is simpler and matches the "user is watching" assumption.
-- **Don't process audio on the phone.** Even if it seems tempting later
-  (live analysis would be cool). It violates the architecture: the laptop is
-  the authority. Keep the phone dumb.
-- **Don't add ML on the phone.** Same reason.
-- **Cross-platform later.** The protocol is plain JSON + TCP/UDP +
-  mDNS, deliberately not tied to anything Android-specific. iOS or web
-  clients could be added later by re-implementing this same protocol.
-- **Type set is not closed.** A timeline could include `bounce`, `strike`,
-  and in the future `scrape` or others. Default fallback: treat unknown type
-  the same as `strike` in Tier 1, or as a generic short vibration in lower
-  tiers. Don't crash on unknown types.
-- **Intensity is per-video relative.** Resist any urge to "normalize" or
-  "correct" across videos. The laptop calibration is intentional.
-
----
-
-## 11. Out of scope (don't build these)
-
-- Phone-side audio capture or analysis.
-- Playing video on the phone.
-- A multi-room / multi-phone broadcast mode.
-- Cloud sync, accounts, telemetry beyond local logs.
-- Internet connectivity. This is a local-network app.
-
----
-
-## 12. Quick reference: the four files Claude Code should produce first
-
-To prove the foundation works, the smallest possible useful build is:
-
-1. `MainActivity.kt` — single Activity with a status TextView and two
-   sliders, holds `KEEP_SCREEN_ON`.
-2. `Capabilities.kt` — detects haptic tier; logs it.
-3. `Discovery.kt` — finds `_haptics._tcp` and surfaces (host, port).
-4. `HapticPlayer.kt` — plays one event according to the detected tier.
-
-Once those four work and you can tap a button to vibrate, layering on the
-TCP channel, timeline, clock sync, and UDP loop is straightforward.
-
----
-
-**End of architecture document.** When in doubt, the design principle is:
-*the phone receives data and translates it into vibration; everything else
-is the laptop's job.*
+| Item | Value |
+|---|---|
+| `minSdk` | 31 (Android 12) |
+| mDNS service type | `_haptics._tcp` |
+| TCP port | from NSD resolution (default 47821) |
+| TCP frame | 4-byte BE length + UTF-8 JSON |
+| UDP port | OS-assigned, reported in `hello.udp_port` |
+| Stale threshold | 300 ms |
+| Batch window | 200 ms |
+| Max sleep chunk | 200 ms |
+| Clock sync rounds | 8, 20 ms apart |
+| Reconnect backoff | 1 s → 2 s → 4 s → … → 30 s cap |
+| Strength slider range | 0.5× – 1.5× |
+| Min intensity default | 0.15 |
+| SharedPreferences | `haptic_settings` / `strength_scale`, `min_intensity` |
+| UI framework | Jetpack Compose + Material3 |
