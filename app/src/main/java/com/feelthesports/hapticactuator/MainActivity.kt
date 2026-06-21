@@ -44,17 +44,23 @@ import com.feelthesports.hapticactuator.net.SyncChannel
 import com.feelthesports.hapticactuator.timeline.Scheduler
 import com.feelthesports.hapticactuator.timeline.Timeline
 import com.feelthesports.hapticactuator.ui.theme.HapticActuatorTheme
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.net.InetAddress
 
 private const val TAG = "MainActivity"
 private const val PREFS_NAME = "haptic_settings"
 private const val KEY_STRENGTH = "strength_scale"
 private const val KEY_MIN_INTENSITY = "min_intensity"
+private const val RECONNECT_DELAY_MIN_MS = 1_000L
+private const val RECONNECT_DELAY_MAX_MS = 30_000L
 
 sealed class ConnectionStatus {
     object Searching : ConnectionStatus()
+    data class Reconnecting(val name: String) : ConnectionStatus()
     data class Connecting(val name: String) : ConnectionStatus()
     data class Connected(val name: String) : ConnectionStatus()
 }
@@ -74,11 +80,21 @@ class MainActivity : ComponentActivity() {
     private var strengthScale: Float  by mutableFloatStateOf(1.0f)
     private var minIntensity: Float   by mutableFloatStateOf(0.15f)
 
+    // Promoted from onCreate locals so connectTo() can reference them
+    private lateinit var capabilities: HapticCapabilities
+
+    // Reconnect state
+    private var lastHost: InetAddress? = null
+    private var lastPort: Int = 0
+    private var lastName: String = ""
+    private var reconnectJob: Job? = null
+    private var reconnectDelay: Long = RECONNECT_DELAY_MIN_MS
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        val capabilities = Capabilities.detect(this)
+        capabilities = Capabilities.detect(this)
         val hapticPlayer = HapticPlayer(this, capabilities)
         val powerManager = getSystemService(PowerManager::class.java)
         scheduler = Scheduler(hapticPlayer)
@@ -92,90 +108,21 @@ class MainActivity : ComponentActivity() {
         discovery = Discovery(this).apply {
             onServiceResolved = { host, port, name ->
                 runOnUiThread {
-                    connectionStatus = ConnectionStatus.Connecting(name)
-                    clockOffsetMs  = null
-                    lastSyncMediaT = null
-
-                    // Tear down any previous connection
-                    syncChannel?.close();    syncChannel    = null
-                    controlChannel?.disconnect(); controlChannel = null
-
-                    // Create UDP socket first — its port goes into the hello message
-                    val syncCh = SyncChannel().also { syncChannel = it }
-                    syncCh.onSyncPulse = { mediaT, tServerNs, rate ->
-                        mediaClock.syncAnchor(mediaT, tServerNs, rate)
-                        lastSyncMediaT = mediaT
-                    }
-                    syncCh.start(lifecycleScope)
-
-                    val ch = ControlChannel(host, port, capabilities, udpPort = syncCh.port)
-                    val clockSync = ClockSync(ch)
-
-                    ch.onConnected = {
-                        connectionStatus = ConnectionStatus.Connected(name)
-                        lifecycleScope.launch(Dispatchers.IO) {
-                            val offset = clockSync.sync()
-                            mediaClock.setOffset(offset)
-                            withContext(Dispatchers.Main) {
-                                clockOffsetMs = offset / 1_000_000
-                                Log.d(TAG, "Clock sync complete: $clockOffsetMs ms offset")
-                            }
-                        }
-                    }
-                    ch.onTimeResp = { t0, ts, t1 -> clockSync.onTimeResp(t0, ts, t1) }
-                    ch.onTimeline = { data ->
-                        val timeline = Timeline.parse(data)
-                        currentTimeline = timeline
-                        eventCount = timeline.events.size
-                        Log.d(TAG, "Timeline loaded: ${timeline.events.size} events")
-                        mediaClock.play(timeline.events.firstOrNull()?.time ?: 0.0)
-                        scheduler.start(timeline, lifecycleScope, mediaClock)
-                    }
-                    ch.onPlay  = { t, tServerNs, rate ->
-                        Log.d(TAG, "play  media_t=$t rate=$rate")
-                        mediaClock.syncAnchor(t, tServerNs, rate)
-                        currentTimeline?.let { scheduler.start(it, lifecycleScope, mediaClock) }
-                    }
-                    ch.onPause = { t, tServerNs ->
-                        Log.d(TAG, "pause media_t=$t")
-                        mediaClock.syncAnchor(t, tServerNs, 0.0)
-                        scheduler.stop()
-                    }
-                    ch.onSeek  = { t, tServerNs ->
-                        Log.d(TAG, "seek  media_t=$t")
-                        mediaClock.syncAnchor(t, tServerNs, mediaClock.rate)
-                        if (mediaClock.isPlaying) {
-                            currentTimeline?.let { scheduler.start(it, lifecycleScope, mediaClock) }
-                        }
-                    }
-                    ch.onRate  = { r, tServerNs ->
-                        Log.d(TAG, "rate  rate=$r")
-                        mediaClock.syncAnchor(mediaClock.mediaTime(), tServerNs, r)
-                        if (mediaClock.isPlaying) {
-                            currentTimeline?.let { scheduler.start(it, lifecycleScope, mediaClock) }
-                        }
-                    }
-                    ch.onDisconnected = {
-                        scheduler.stop()
-                        syncChannel?.close(); syncChannel = null
-                        currentTimeline = null
-                        connectionStatus = ConnectionStatus.Searching
-                        if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
-                            discovery.start()
-                        }
-                    }
-
-                    ch.connect(lifecycleScope)
-                    controlChannel = ch
+                    // NSD gave us a (possibly fresher) address — update and connect.
+                    lastHost = host; lastPort = port; lastName = name
+                    reconnectDelay = RECONNECT_DELAY_MIN_MS
+                    connectTo(host, port, name)
                 }
             }
             onServiceLost = {
+                // Don't tear down the TCP connection here — let it die naturally via
+                // onDisconnected if the server is truly gone. Just restart NSD browsing
+                // so we catch re-advertisement quickly.
                 runOnUiThread {
-                    scheduler.stop()
-                    syncChannel?.close();         syncChannel    = null
-                    controlChannel?.disconnect(); controlChannel = null
-                    currentTimeline = null
-                    connectionStatus = ConnectionStatus.Searching
+                    Log.d(TAG, "mDNS service lost; re-browsing")
+                    if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                        discovery.start()
+                    }
                 }
             }
         }
@@ -217,13 +164,128 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** Wire up and open a TCP connection to [host]:[port]. Called from Main thread. */
+    private fun connectTo(host: InetAddress, port: Int, name: String) {
+        reconnectJob?.cancel()
+
+        connectionStatus = ConnectionStatus.Connecting(name)
+        clockOffsetMs  = null
+        lastSyncMediaT = null
+
+        syncChannel?.close();        syncChannel    = null
+        controlChannel?.disconnect(); controlChannel = null
+
+        val syncCh = SyncChannel().also { syncChannel = it }
+        syncCh.onSyncPulse = { mediaT, tServerNs, rate ->
+            mediaClock.syncAnchor(mediaT, tServerNs, rate)
+            lastSyncMediaT = mediaT
+        }
+        syncCh.start(lifecycleScope)
+
+        val ch = ControlChannel(host, port, capabilities, udpPort = syncCh.port)
+        val clockSync = ClockSync(ch)
+
+        ch.onConnected = {
+            connectionStatus = ConnectionStatus.Connected(name)
+            reconnectDelay = RECONNECT_DELAY_MIN_MS
+            lifecycleScope.launch(Dispatchers.IO) {
+                val offset = clockSync.sync()
+                mediaClock.setOffset(offset)
+                withContext(Dispatchers.Main) {
+                    clockOffsetMs = offset / 1_000_000
+                    Log.d(TAG, "Clock sync complete: $clockOffsetMs ms offset")
+                }
+            }
+        }
+        ch.onTimeResp = { t0, ts, t1 -> clockSync.onTimeResp(t0, ts, t1) }
+        ch.onTimeline = { data ->
+            val timeline = Timeline.parse(data)
+            currentTimeline = timeline
+            eventCount = timeline.events.size
+            Log.d(TAG, "Timeline loaded: ${timeline.events.size} events")
+            // Don't start the scheduler here — wait for the play message that follows,
+            // which carries the correct media position and server anchor timestamp.
+        }
+        ch.onPlay  = { t, tServerNs, rate ->
+            Log.d(TAG, "play  media_t=$t rate=$rate")
+            mediaClock.syncAnchor(t, tServerNs, rate)
+            currentTimeline?.let { scheduler.start(it, lifecycleScope, mediaClock) }
+        }
+        ch.onPause = { t, tServerNs ->
+            Log.d(TAG, "pause media_t=$t")
+            mediaClock.syncAnchor(t, tServerNs, 0.0)
+            scheduler.stop()
+        }
+        ch.onSeek  = { t, tServerNs ->
+            Log.d(TAG, "seek  media_t=$t")
+            mediaClock.syncAnchor(t, tServerNs, mediaClock.rate)
+            if (mediaClock.isPlaying) {
+                currentTimeline?.let { scheduler.start(it, lifecycleScope, mediaClock) }
+            }
+        }
+        ch.onRate  = { r, tServerNs ->
+            Log.d(TAG, "rate  rate=$r")
+            mediaClock.syncAnchor(mediaClock.mediaTime(), tServerNs, r)
+            if (mediaClock.isPlaying) {
+                currentTimeline?.let { scheduler.start(it, lifecycleScope, mediaClock) }
+            }
+        }
+        ch.onDisconnected = {
+            scheduler.stop()
+            syncChannel?.close(); syncChannel = null
+            currentTimeline = null
+            connectionStatus = ConnectionStatus.Reconnecting(name)
+            Log.d(TAG, "Disconnected from $name")
+            if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                scheduleReconnect()
+            }
+        }
+
+        ch.connect(lifecycleScope)
+        controlChannel = ch
+    }
+
+    /**
+     * Schedule a reconnect attempt with exponential backoff.
+     * Tries the last known IP directly first (fast path ~100 ms if server is up),
+     * while also restarting NSD browsing in parallel as a fallback for IP changes.
+     */
+    private fun scheduleReconnect() {
+        // NSD fallback: catch server re-advertisement or IP change
+        discovery.start()
+
+        val host = lastHost ?: return   // no known address yet; rely on NSD only
+        val delayMs = reconnectDelay
+        reconnectDelay = (reconnectDelay * 2).coerceAtMost(RECONNECT_DELAY_MAX_MS)
+        Log.d(TAG, "Reconnect to $lastName in ${delayMs}ms (next: ${reconnectDelay}ms)")
+
+        reconnectJob?.cancel()
+        reconnectJob = lifecycleScope.launch {
+            delay(delayMs)
+            val status = connectionStatus
+            if (status is ConnectionStatus.Reconnecting || status is ConnectionStatus.Searching) {
+                Log.d(TAG, "Direct reconnect attempt → $host:$lastPort")
+                connectTo(host, lastPort, lastName)
+            }
+        }
+    }
+
     override fun onResume() {
         super.onResume()
+        reconnectDelay = RECONNECT_DELAY_MIN_MS
         discovery.start()
+        // If we have a known server and aren't already connected/connecting, retry immediately.
+        val status = connectionStatus
+        if (lastHost != null &&
+            status !is ConnectionStatus.Connected &&
+            status !is ConnectionStatus.Connecting) {
+            scheduleReconnect()
+        }
     }
 
     override fun onPause() {
         super.onPause()
+        reconnectJob?.cancel()
         scheduler.stop()
         syncChannel?.close();         syncChannel    = null
         discovery.stop()
@@ -251,7 +313,7 @@ fun MainScreen(
     lastSyncMediaT: Double?,
     strengthScale: Float,
     minIntensity: Float,
-    onTestVibration: (type: String) -> Unit,
+    onTestVibration: (visionType: String?) -> Unit,
     onTestTimeline: () -> Unit,
     onStrengthScaleChange: (Float) -> Unit,
     onMinIntensityChange: (Float) -> Unit,
@@ -266,14 +328,16 @@ fun MainScreen(
         Text("Haptic Actuator", style = MaterialTheme.typography.headlineMedium)
 
         val statusText = when (connectionStatus) {
-            is ConnectionStatus.Searching  -> "Searching for laptop…"
-            is ConnectionStatus.Connecting -> "Connecting to ${connectionStatus.name}…"
-            is ConnectionStatus.Connected  -> "Connected to ${connectionStatus.name}"
+            is ConnectionStatus.Searching    -> "Searching for laptop…"
+            is ConnectionStatus.Reconnecting -> "Reconnecting to ${connectionStatus.name}…"
+            is ConnectionStatus.Connecting   -> "Connecting to ${connectionStatus.name}…"
+            is ConnectionStatus.Connected    -> "Connected to ${connectionStatus.name}"
         }
         val statusColor = when (connectionStatus) {
-            is ConnectionStatus.Searching  -> MaterialTheme.colorScheme.surfaceVariant
-            is ConnectionStatus.Connecting -> MaterialTheme.colorScheme.secondaryContainer
-            is ConnectionStatus.Connected  -> MaterialTheme.colorScheme.primaryContainer
+            is ConnectionStatus.Searching    -> MaterialTheme.colorScheme.surfaceVariant
+            is ConnectionStatus.Reconnecting -> MaterialTheme.colorScheme.errorContainer
+            is ConnectionStatus.Connecting   -> MaterialTheme.colorScheme.secondaryContainer
+            is ConnectionStatus.Connected    -> MaterialTheme.colorScheme.primaryContainer
         }
         Card(colors = CardDefaults.cardColors(containerColor = statusColor)) {
             Text(statusText, modifier = Modifier.padding(12.dp))

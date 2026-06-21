@@ -21,7 +21,7 @@ class HapticPlayer(context: Context, private val capabilities: HapticCapabilitie
 
     /** Estimated wall-clock duration of a batch composition in milliseconds. */
     fun estimateBatchDurationMs(events: List<BatchEvent>): Int {
-        if (events.isEmpty()) return 0
+        if (events.isEmpty() || capabilities.tier != HapticTier.COMPOSITION) return 0
         val last = events.last()
         val lastId = pickPrimitive(last.visionType)
         return last.delayFromFirstMs + vibrator.getPrimitiveDurations(lastId)[0]
@@ -76,7 +76,8 @@ class HapticPlayer(context: Context, private val capabilities: HapticCapabilitie
             else     -> listOf("CLICK", "TICK", "LOW_TICK", "THUD")  // "strike", null, unknown
         }
         val name = prefs.firstOrNull { it in capabilities.supportedPrimitives }
-            ?: capabilities.supportedPrimitives.first()
+            ?: capabilities.supportedPrimitives.firstOrNull()
+            ?: return VibrationEffect.Composition.PRIMITIVE_CLICK
         return NAME_TO_ID[name] ?: VibrationEffect.Composition.PRIMITIVE_CLICK
     }
 
