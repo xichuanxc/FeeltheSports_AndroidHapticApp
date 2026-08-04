@@ -7,9 +7,11 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -18,6 +20,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -45,7 +48,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
@@ -324,43 +329,73 @@ fun MainScreen(
         is ConnectionStatus.Connecting   -> "Connecting to ${connectionStatus.name}…"
         is ConnectionStatus.Connected    -> "Connected to ${connectionStatus.name}"
     }
-    val statusColor = when (connectionStatus) {
-        is ConnectionStatus.Searching    -> MaterialTheme.colorScheme.surfaceVariant
-        is ConnectionStatus.Reconnecting -> MaterialTheme.colorScheme.errorContainer
-        is ConnectionStatus.Connecting   -> MaterialTheme.colorScheme.secondaryContainer
-        is ConnectionStatus.Connected    -> MaterialTheme.colorScheme.primaryContainer
+    val dotColor = when (connectionStatus) {
+        is ConnectionStatus.Searching    -> Color(0xFF9E9E9E)
+        is ConnectionStatus.Reconnecting -> Color(0xFFFF9800)
+        is ConnectionStatus.Connecting   -> Color(0xFFFF9800)
+        is ConnectionStatus.Connected    -> Color(0xFF4CAF50)
     }
 
     Box(modifier = modifier.fillMaxSize()) {
         Column(
-            modifier = Modifier
+            modifier            = Modifier
                 .fillMaxSize()
-                .padding(32.dp),
+                .padding(horizontal = 32.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
         ) {
-            Surface(
-                modifier = Modifier.size(240.dp),
-                shape    = CircleShape,
-                color    = Color(0xFF0D1628),
+            // Main content centered in available space
+            Box(
+                modifier         = Modifier.weight(1f),
+                contentAlignment = Alignment.Center,
             ) {
-                androidx.compose.foundation.Image(
-                    painter            = painterResource(id = R.mipmap.ic_launcher_foreground),
-                    contentDescription = "FeeltheSports Logo",
-                )
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    androidx.compose.foundation.Image(
+                        painter            = painterResource(R.drawable.haptic_icon),
+                        contentDescription = "FeeltheSports Logo",
+                        modifier           = Modifier.size(160.dp),
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        text       = "FeeltheSports",
+                        style      = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Spacer(Modifier.height(40.dp))
+                    Surface(
+                        shape = RoundedCornerShape(50),
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                    ) {
+                        Row(
+                            modifier              = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment     = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .background(dotColor, CircleShape),
+                            )
+                            Text(
+                                text  = statusText,
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+                    }
+                }
             }
-            Spacer(modifier = Modifier.height(32.dp))
-            Card(
-                colors   = CardDefaults.cardColors(containerColor = statusColor),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(
-                    text     = statusText,
-                    modifier = Modifier.padding(16.dp),
-                    style    = MaterialTheme.typography.bodyLarge,
-                )
-            }
+
+            // University logo at the bottom
+            androidx.compose.foundation.Image(
+                painter            = painterResource(R.drawable.university_of_waikato_logo),
+                contentDescription = "University of Waikato",
+                contentScale       = ContentScale.Fit,
+                modifier           = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp),
+            )
+            Spacer(Modifier.height(24.dp))
         }
+
         IconButton(
             onClick  = onOpenSettings,
             modifier = Modifier
