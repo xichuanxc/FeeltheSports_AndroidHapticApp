@@ -97,7 +97,7 @@ class MainActivity : ComponentActivity() {
     private var clockOffsetMs: Long?  by mutableStateOf(null)
     private var lastSyncMediaT: Double? by mutableStateOf(null)
     private var strengthScale: Float  by mutableFloatStateOf(1.0f)
-    private var minIntensity: Float   by mutableFloatStateOf(0.15f)
+    private var minIntensity: Float   by mutableFloatStateOf(0.0f)
     private var showSettings: Boolean by mutableStateOf(false)
 
     private lateinit var capabilities: HapticCapabilities
@@ -119,7 +119,7 @@ class MainActivity : ComponentActivity() {
 
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         strengthScale = prefs.getFloat(KEY_STRENGTH, 1.0f)
-        minIntensity  = prefs.getFloat(KEY_MIN_INTENSITY, 0.15f)
+        minIntensity  = prefs.getFloat(KEY_MIN_INTENSITY, 0.0f)
         scheduler.strengthScale = strengthScale
         scheduler.minIntensity  = minIntensity
 
@@ -489,19 +489,32 @@ fun SettingsScreen(
 
             HorizontalDivider()
 
-            Text("Haptic strength:  ${"%.2f".format(strengthScale)}×", style = MaterialTheme.typography.titleSmall)
+            val amplitudeEnabled = capabilities.hasAmplitudeControl
+            val disabledLabelColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+
+            Text(
+                text  = "Haptic strength:  ${"%.2f".format(strengthScale)}×",
+                style = MaterialTheme.typography.titleSmall,
+                color = if (amplitudeEnabled) Color.Unspecified else disabledLabelColor,
+            )
             Slider(
                 value         = strengthScale,
                 onValueChange = onStrengthScaleChange,
                 valueRange    = 0.5f..1.5f,
+                enabled       = amplitudeEnabled,
                 modifier      = Modifier.fillMaxWidth(),
             )
 
-            Text("Min intensity:  ${"%.2f".format(minIntensity)}", style = MaterialTheme.typography.titleSmall)
+            Text(
+                text  = "Min intensity:  ${"%.2f".format(minIntensity)}",
+                style = MaterialTheme.typography.titleSmall,
+                color = if (amplitudeEnabled) Color.Unspecified else disabledLabelColor,
+            )
             Slider(
                 value         = minIntensity,
                 onValueChange = onMinIntensityChange,
                 valueRange    = 0f..0.5f,
+                enabled       = amplitudeEnabled,
                 modifier      = Modifier.fillMaxWidth(),
             )
 
