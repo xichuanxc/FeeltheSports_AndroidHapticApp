@@ -679,7 +679,7 @@ fun AboutScreen(onBack: () -> Unit) {
             HorizontalDivider()
 
             // Build info
-            AboutRow(label = "Version",    value = "1.0.0")
+            AboutRow(label = "Version",    value = BuildConfig.VERSION_NAME)
             AboutRow(label = "Build date", value = "4 Aug 2026")
             AboutRow(label = "Contact",    value = "xichuanxc@gmail.com")
 
