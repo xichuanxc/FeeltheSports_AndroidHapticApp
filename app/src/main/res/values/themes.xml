@@ -1,5 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
-    <style name="Theme.HapticActuator" parent="android:Theme.Material.Light.NoActionBar" />
+    <style name="Theme.HapticActuator" parent="android:Theme.Material.Light.NoActionBar">
+        <!-- Splash screen icon is the raw PNG (no inset) so it fills the full circle.
+             The launcher adaptive icon uses haptic_icon_foreground.xml with 8dp inset
+             to stay within the squircle safe zone — these are independent drawables. -->
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/haptic_splash_icon</item>
+        <item name="android:windowSplashScreenBackground">@color/haptic_navy</item>
+    </style>
 </resources>

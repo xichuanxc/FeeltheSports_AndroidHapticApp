@@ -655,18 +655,6 @@ fun AboutScreen(onBack: () -> Unit) {
         ) {
             Spacer(Modifier.height(8.dp))
 
-            // University logo
-            androidx.compose.foundation.Image(
-                painter            = painterResource(R.drawable.university_of_waikato_logo),
-                contentDescription = "University of Waikato",
-                contentScale       = ContentScale.Fit,
-                modifier           = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp),
-            )
-
-            HorizontalDivider()
-
             // App identity
             Text("FeeltheSports", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
             Text(
@@ -691,9 +679,21 @@ fun AboutScreen(onBack: () -> Unit) {
             HorizontalDivider()
 
             // Build info
-            AboutRow(label = "Version",    value = "1.0")
+            AboutRow(label = "Version",    value = "1.0.0")
             AboutRow(label = "Build date", value = "4 Aug 2026")
             AboutRow(label = "Contact",    value = "xichuanxc@gmail.com")
+
+            HorizontalDivider()
+
+            // University logo at the bottom
+            androidx.compose.foundation.Image(
+                painter            = painterResource(R.drawable.university_of_waikato_logo),
+                contentDescription = "University of Waikato",
+                contentScale       = ContentScale.Fit,
+                modifier           = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp),
+            )
 
             Spacer(Modifier.height(24.dp))
         }
