@@ -1,7 +1,10 @@
 package com.feelthesports.hapticactuator
 
+import android.app.NotificationManager
+import android.content.Intent
 import android.os.Bundle
 import android.os.PowerManager
+import android.provider.Settings as AndroidSettings
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -24,10 +27,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.Surface
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -43,12 +49,14 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -102,8 +110,12 @@ class MainActivity : ComponentActivity() {
     private var strengthScale: Float  by mutableFloatStateOf(1.0f)
     private var minIntensity: Float   by mutableFloatStateOf(0.0f)
     private var showSettings: Boolean by mutableStateOf(false)
+    private var showAbout: Boolean    by mutableStateOf(false)
+    private var showDndDialog: Boolean by mutableStateOf(false)
+    private var dndDismissed: Boolean = false
 
     private lateinit var capabilities: HapticCapabilities
+    private lateinit var notificationManager: NotificationManager
 
     private var lastHost: InetAddress? = null
     private var lastPort: Int = 0
@@ -118,6 +130,7 @@ class MainActivity : ComponentActivity() {
         capabilities = Capabilities.detect(this)
         val hapticPlayer = HapticPlayer(this, capabilities)
         val powerManager = getSystemService(PowerManager::class.java)
+        notificationManager = getSystemService(NotificationManager::class.java)
         scheduler = Scheduler(hapticPlayer)
 
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
@@ -147,8 +160,9 @@ class MainActivity : ComponentActivity() {
         setContent {
             HapticActuatorTheme {
                 KeepScreenOn()
-                if (showSettings) {
-                    SettingsScreen(
+                val context = LocalContext.current
+                when {
+                    showSettings -> SettingsScreen(
                         capabilities        = capabilities,
                         isPowerSaveMode     = powerManager.isPowerSaveMode,
                         eventCount          = eventCount,
@@ -175,14 +189,37 @@ class MainActivity : ComponentActivity() {
                         },
                         onBack = { showSettings = false },
                     )
-                } else {
-                    Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+                    showAbout -> AboutScreen(onBack = { showAbout = false })
+                    else -> Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                         MainScreen(
                             connectionStatus = connectionStatus,
                             onOpenSettings   = { showSettings = true },
+                            onOpenAbout      = { showAbout = true },
+                            onExit           = { finish() },
                             modifier         = Modifier.padding(innerPadding),
                         )
                     }
+                }
+
+                if (showDndDialog) {
+                    AlertDialog(
+                        onDismissRequest = { showDndDialog = false; dndDismissed = true },
+                        title = { Text("Enable Do Not Disturb") },
+                        text  = { Text("FeeltheSports works best without interruptions. Grant Do Not Disturb access to silence notifications during haptic feedback sessions.") },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                showDndDialog = false
+                                context.startActivity(
+                                    Intent(AndroidSettings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)
+                                )
+                            }) { Text("Go to Settings") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { showDndDialog = false; dndDismissed = true }) {
+                                Text("Not Now")
+                            }
+                        },
+                    )
                 }
             }
         }
@@ -287,6 +324,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (notificationManager.isNotificationPolicyAccessGranted) {
+            notificationManager.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_ALARMS)
+            showDndDialog = false
+        } else if (!dndDismissed) {
+            showDndDialog = true
+        }
         reconnectDelay = RECONNECT_DELAY_MIN_MS
         discovery.start()
         val status = connectionStatus
@@ -299,6 +342,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
+        if (notificationManager.isNotificationPolicyAccessGranted) {
+            notificationManager.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_ALL)
+        }
         reconnectJob?.cancel()
         scheduler.stop()
         syncChannel?.close();         syncChannel    = null
@@ -321,8 +367,26 @@ private fun KeepScreenOn() {
 fun MainScreen(
     connectionStatus: ConnectionStatus,
     onOpenSettings: () -> Unit,
+    onOpenAbout: () -> Unit,
+    onExit: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var showExitDialog by remember { mutableStateOf(false) }
+    BackHandler { showExitDialog = true }
+
+    if (showExitDialog) {
+        AlertDialog(
+            onDismissRequest = { showExitDialog = false },
+            title            = { Text("Exit") },
+            text             = { Text("Are you sure you want to exit FeeltheSports?") },
+            confirmButton    = {
+                TextButton(onClick = onExit) { Text("Exit") }
+            },
+            dismissButton    = {
+                TextButton(onClick = { showExitDialog = false }) { Text("Cancel") }
+            },
+        )
+    }
     val statusText = when (connectionStatus) {
         is ConnectionStatus.Searching    -> "Searching for Haptic Server…"
         is ConnectionStatus.Reconnecting -> "Reconnecting to ${connectionStatus.name}…"
@@ -396,16 +460,17 @@ fun MainScreen(
             Spacer(Modifier.height(24.dp))
         }
 
-        IconButton(
-            onClick  = onOpenSettings,
+        Row(
             modifier = Modifier
                 .align(Alignment.TopEnd)
-                .padding(8.dp),
+                .padding(4.dp),
         ) {
-            Icon(
-                imageVector        = Icons.Filled.Settings,
-                contentDescription = "Settings",
-            )
+            IconButton(onClick = onOpenAbout) {
+                Icon(Icons.Filled.Info, contentDescription = "About")
+            }
+            IconButton(onClick = onOpenSettings) {
+                Icon(Icons.Filled.Settings, contentDescription = "Settings")
+            }
         }
     }
 }
@@ -556,6 +621,40 @@ fun SettingsScreen(
             }
 
             Spacer(Modifier.height(24.dp))
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AboutScreen(onBack: () -> Unit) {
+    BackHandler(onBack = onBack)
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("About") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            imageVector        = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back",
+                        )
+                    }
+                },
+            )
+        },
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("FeeltheSports", style = MaterialTheme.typography.headlineMedium)
+            Text("Haptic Feedback Application", style = MaterialTheme.typography.titleMedium)
+            HorizontalDivider()
+            // Detailed information to be added
         }
     }
 }
