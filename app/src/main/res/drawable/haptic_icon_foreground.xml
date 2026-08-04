@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Wraps haptic_icon.png with 18dp insets so the artwork sits fully
+    within the adaptive-icon safe zone (72dp centred in 108dp canvas).
+    The dark navy background (ic_launcher_background) fills the margins
+    seamlessly since it matches the icon's own background colour.
+-->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/haptic_icon"
+    android:inset="18dp" />
