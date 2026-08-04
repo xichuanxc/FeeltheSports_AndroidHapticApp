@@ -1,10 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--
-    Adaptive icon used for the Android 12 splash screen only.
-    No inset here so the artwork fills the full splash circle.
-    The launcher uses haptic_icon_foreground.xml (with 8dp inset) to
-    prevent squircle mask clipping.
--->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@drawable/ic_launcher_background" />
     <foreground android:drawable="@drawable/haptic_icon_padded" />
