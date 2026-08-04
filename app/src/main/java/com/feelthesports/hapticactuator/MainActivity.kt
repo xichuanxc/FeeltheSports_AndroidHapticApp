@@ -319,7 +319,7 @@ fun MainScreen(
     modifier: Modifier = Modifier,
 ) {
     val statusText = when (connectionStatus) {
-        is ConnectionStatus.Searching    -> "Searching for laptop…"
+        is ConnectionStatus.Searching    -> "Searching for Haptic Server…"
         is ConnectionStatus.Reconnecting -> "Reconnecting to ${connectionStatus.name}…"
         is ConnectionStatus.Connecting   -> "Connecting to ${connectionStatus.name}…"
         is ConnectionStatus.Connected    -> "Connected to ${connectionStatus.name}"
