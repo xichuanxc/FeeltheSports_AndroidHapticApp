@@ -4,31 +4,48 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
@@ -79,11 +96,10 @@ class MainActivity : ComponentActivity() {
     private var lastSyncMediaT: Double? by mutableStateOf(null)
     private var strengthScale: Float  by mutableFloatStateOf(1.0f)
     private var minIntensity: Float   by mutableFloatStateOf(0.15f)
+    private var showSettings: Boolean by mutableStateOf(false)
 
-    // Promoted from onCreate locals so connectTo() can reference them
     private lateinit var capabilities: HapticCapabilities
 
-    // Reconnect state
     private var lastHost: InetAddress? = null
     private var lastPort: Int = 0
     private var lastName: String = ""
@@ -108,16 +124,12 @@ class MainActivity : ComponentActivity() {
         discovery = Discovery(this).apply {
             onServiceResolved = { host, port, name ->
                 runOnUiThread {
-                    // NSD gave us a (possibly fresher) address — update and connect.
                     lastHost = host; lastPort = port; lastName = name
                     reconnectDelay = RECONNECT_DELAY_MIN_MS
                     connectTo(host, port, name)
                 }
             }
             onServiceLost = {
-                // Don't tear down the TCP connection here — let it die naturally via
-                // onDisconnected if the server is truly gone. Just restart NSD browsing
-                // so we catch re-advertisement quickly.
                 runOnUiThread {
                     Log.d(TAG, "mDNS service lost; re-browsing")
                     if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
@@ -130,18 +142,17 @@ class MainActivity : ComponentActivity() {
         setContent {
             HapticActuatorTheme {
                 KeepScreenOn()
-                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    MainScreen(
-                        capabilities     = capabilities,
-                        isPowerSaveMode  = powerManager.isPowerSaveMode,
-                        connectionStatus = connectionStatus,
-                        eventCount       = eventCount,
-                        clockOffsetMs    = clockOffsetMs,
-                        lastSyncMediaT   = lastSyncMediaT,
-                        strengthScale    = strengthScale,
-                        minIntensity     = minIntensity,
-                        onTestVibration  = { visionType -> hapticPlayer.play(visionType, 0.8f) },
-                        onTestTimeline   = {
+                if (showSettings) {
+                    SettingsScreen(
+                        capabilities        = capabilities,
+                        isPowerSaveMode     = powerManager.isPowerSaveMode,
+                        eventCount          = eventCount,
+                        clockOffsetMs       = clockOffsetMs,
+                        lastSyncMediaT      = lastSyncMediaT,
+                        strengthScale       = strengthScale,
+                        minIntensity        = minIntensity,
+                        onTestVibration     = { visionType -> hapticPlayer.play(visionType, 0.8f) },
+                        onTestTimeline      = {
                             val t = Timeline.createTest()
                             eventCount = t.events.size
                             val testClock = MediaClock().apply { play(0.0) }
@@ -157,14 +168,21 @@ class MainActivity : ComponentActivity() {
                             scheduler.minIntensity = v
                             prefs.edit().putFloat(KEY_MIN_INTENSITY, v).apply()
                         },
-                        modifier = Modifier.padding(innerPadding),
+                        onBack = { showSettings = false },
                     )
+                } else {
+                    Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+                        MainScreen(
+                            connectionStatus = connectionStatus,
+                            onOpenSettings   = { showSettings = true },
+                            modifier         = Modifier.padding(innerPadding),
+                        )
+                    }
                 }
             }
         }
     }
 
-    /** Wire up and open a TCP connection to [host]:[port]. Called from Main thread. */
     private fun connectTo(host: InetAddress, port: Int, name: String) {
         reconnectJob?.cancel()
 
@@ -203,8 +221,6 @@ class MainActivity : ComponentActivity() {
             currentTimeline = timeline
             eventCount = timeline.events.size
             Log.d(TAG, "Timeline loaded: ${timeline.events.size} events")
-            // Don't start the scheduler here — wait for the play message that follows,
-            // which carries the correct media position and server anchor timestamp.
         }
         ch.onPlay  = { t, tServerNs, rate ->
             Log.d(TAG, "play  media_t=$t rate=$rate")
@@ -245,16 +261,10 @@ class MainActivity : ComponentActivity() {
         controlChannel = ch
     }
 
-    /**
-     * Schedule a reconnect attempt with exponential backoff.
-     * Tries the last known IP directly first (fast path ~100 ms if server is up),
-     * while also restarting NSD browsing in parallel as a fallback for IP changes.
-     */
     private fun scheduleReconnect() {
-        // NSD fallback: catch server re-advertisement or IP change
         discovery.start()
 
-        val host = lastHost ?: return   // no known address yet; rely on NSD only
+        val host = lastHost ?: return
         val delayMs = reconnectDelay
         reconnectDelay = (reconnectDelay * 2).coerceAtMost(RECONNECT_DELAY_MAX_MS)
         Log.d(TAG, "Reconnect to $lastName in ${delayMs}ms (next: ${reconnectDelay}ms)")
@@ -274,7 +284,6 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         reconnectDelay = RECONNECT_DELAY_MIN_MS
         discovery.start()
-        // If we have a known server and aren't already connected/connecting, retry immediately.
         val status = connectionStatus
         if (lastHost != null &&
             status !is ConnectionStatus.Connected &&
@@ -305,9 +314,67 @@ private fun KeepScreenOn() {
 
 @Composable
 fun MainScreen(
+    connectionStatus: ConnectionStatus,
+    onOpenSettings: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val statusText = when (connectionStatus) {
+        is ConnectionStatus.Searching    -> "Searching for laptop…"
+        is ConnectionStatus.Reconnecting -> "Reconnecting to ${connectionStatus.name}…"
+        is ConnectionStatus.Connecting   -> "Connecting to ${connectionStatus.name}…"
+        is ConnectionStatus.Connected    -> "Connected to ${connectionStatus.name}"
+    }
+    val statusColor = when (connectionStatus) {
+        is ConnectionStatus.Searching    -> MaterialTheme.colorScheme.surfaceVariant
+        is ConnectionStatus.Reconnecting -> MaterialTheme.colorScheme.errorContainer
+        is ConnectionStatus.Connecting   -> MaterialTheme.colorScheme.secondaryContainer
+        is ConnectionStatus.Connected    -> MaterialTheme.colorScheme.primaryContainer
+    }
+
+    Box(modifier = modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Image(
+                painter            = painterResource(id = R.mipmap.ic_launcher_round),
+                contentDescription = "FeeltheSports Logo",
+                modifier           = Modifier.size(120.dp),
+            )
+            Spacer(modifier = Modifier.height(32.dp))
+            Card(
+                colors   = CardDefaults.cardColors(containerColor = statusColor),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text     = statusText,
+                    modifier = Modifier.padding(16.dp),
+                    style    = MaterialTheme.typography.bodyLarge,
+                )
+            }
+        }
+        IconButton(
+            onClick  = onOpenSettings,
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(8.dp),
+        ) {
+            Icon(
+                imageVector        = Icons.Filled.Settings,
+                contentDescription = "Settings",
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SettingsScreen(
     capabilities: HapticCapabilities,
     isPowerSaveMode: Boolean,
-    connectionStatus: ConnectionStatus,
     eventCount: Int?,
     clockOffsetMs: Long?,
     lastSyncMediaT: Double?,
@@ -317,144 +384,149 @@ fun MainScreen(
     onTestTimeline: () -> Unit,
     onStrengthScaleChange: (Float) -> Unit,
     onMinIntensityChange: (Float) -> Unit,
-    modifier: Modifier = Modifier,
+    onBack: () -> Unit,
 ) {
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Text("Haptic Actuator", style = MaterialTheme.typography.headlineMedium)
-
-        val statusText = when (connectionStatus) {
-            is ConnectionStatus.Searching    -> "Searching for laptop…"
-            is ConnectionStatus.Reconnecting -> "Reconnecting to ${connectionStatus.name}…"
-            is ConnectionStatus.Connecting   -> "Connecting to ${connectionStatus.name}…"
-            is ConnectionStatus.Connected    -> "Connected to ${connectionStatus.name}"
-        }
-        val statusColor = when (connectionStatus) {
-            is ConnectionStatus.Searching    -> MaterialTheme.colorScheme.surfaceVariant
-            is ConnectionStatus.Reconnecting -> MaterialTheme.colorScheme.errorContainer
-            is ConnectionStatus.Connecting   -> MaterialTheme.colorScheme.secondaryContainer
-            is ConnectionStatus.Connected    -> MaterialTheme.colorScheme.primaryContainer
-        }
-        Card(colors = CardDefaults.cardColors(containerColor = statusColor)) {
-            Text(statusText, modifier = Modifier.padding(12.dp))
-        }
-
-        if (isPowerSaveMode) {
-            Card(
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.errorContainer,
-                ),
-            ) {
-                Text(
-                    text = "Power Save Mode is active — haptics may be suppressed",
-                    modifier = Modifier.padding(12.dp),
-                    color = MaterialTheme.colorScheme.onErrorContainer,
-                )
-            }
-        }
-
-        HorizontalDivider()
-
-        val tierLabel = when (capabilities.tier) {
-            HapticTier.COMPOSITION -> "Tier 1 — Composition primitives (best)"
-            HapticTier.AMPLITUDE   -> "Tier 2 — Amplitude-modulated waveform"
-            HapticTier.BASIC       -> "Tier 3 — Basic on/off buzz"
-        }
-        Text("Haptic tier:  $tierLabel", style = MaterialTheme.typography.titleMedium)
-        Text("API level:  ${capabilities.apiLevel}")
-        Text("Amplitude control:  ${if (capabilities.hasAmplitudeControl) "yes" else "no"}")
-
-        val primitivesText = capabilities.supportedPrimitives
-            .takeIf { it.isNotEmpty() }?.joinToString() ?: "none"
-        Text("Primitives:  $primitivesText")
-
-        if (capabilities.tier == HapticTier.BASIC) {
-            Card(
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.secondaryContainer,
-                ),
-            ) {
-                Text(
-                    text = "This device's haptic hardware is basic. Vibrations will be on/off only.",
-                    modifier = Modifier.padding(12.dp),
-                )
-            }
-        }
-
-        HorizontalDivider()
-
-        val diagColor = MaterialTheme.colorScheme.onSurfaceVariant
-        val diagStyle = MaterialTheme.typography.bodySmall
-        Text(
-            text = when (clockOffsetMs) {
-                null -> "Clock sync:  pending"
-                else -> "Clock sync:  $clockOffsetMs ms offset"
-            },
-            style = diagStyle, color = diagColor,
-        )
-        Text(
-            text = when (eventCount) {
-                null -> "Timeline:  none loaded"
-                else -> "Timeline:  $eventCount events"
-            },
-            style = diagStyle, color = diagColor,
-        )
-        Text(
-            text = when (lastSyncMediaT) {
-                null -> "UDP sync:  none received"
-                else -> "UDP sync:  last media_t = ${"%.2f".format(lastSyncMediaT)} s"
-            },
-            style = diagStyle, color = diagColor,
-        )
-
-        HorizontalDivider()
-
-        Text("Haptic strength:  ${"%.2f".format(strengthScale)}×", style = MaterialTheme.typography.titleSmall)
-        Slider(
-            value = strengthScale,
-            onValueChange = onStrengthScaleChange,
-            valueRange = 0.5f..1.5f,
-            modifier = Modifier.fillMaxWidth(),
-        )
-
-        Text("Min intensity:  ${"%.2f".format(minIntensity)}", style = MaterialTheme.typography.titleSmall)
-        Slider(
-            value = minIntensity,
-            onValueChange = onMinIntensityChange,
-            valueRange = 0f..0.5f,
-            modifier = Modifier.fillMaxWidth(),
-        )
-
-        HorizontalDivider()
-
-        Text("Test vibration (intensity 0.8):", style = MaterialTheme.typography.titleSmall)
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-            modifier = Modifier.fillMaxWidth(),
+    BackHandler(onBack = onBack)
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Settings") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            imageVector        = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back",
+                        )
+                    }
+                },
+            )
+        },
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .padding(horizontal = 24.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            Spacer(Modifier.height(4.dp))
+
+            if (isPowerSaveMode) {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer,
+                    ),
+                ) {
+                    Text(
+                        text     = "Power Save Mode is active — haptics may be suppressed",
+                        modifier = Modifier.padding(12.dp),
+                        color    = MaterialTheme.colorScheme.onErrorContainer,
+                    )
+                }
+            }
+
+            HorizontalDivider()
+
+            val tierLabel = when (capabilities.tier) {
+                HapticTier.COMPOSITION -> "Tier 1 — Composition primitives (best)"
+                HapticTier.AMPLITUDE   -> "Tier 2 — Amplitude-modulated waveform"
+                HapticTier.BASIC       -> "Tier 3 — Basic on/off buzz"
+            }
+            Text("Haptic tier:  $tierLabel", style = MaterialTheme.typography.titleMedium)
+            Text("API level:  ${capabilities.apiLevel}")
+            Text("Amplitude control:  ${if (capabilities.hasAmplitudeControl) "yes" else "no"}")
+
+            val primitivesText = capabilities.supportedPrimitives
+                .takeIf { it.isNotEmpty() }?.joinToString() ?: "none"
+            Text("Primitives:  $primitivesText")
+
+            if (capabilities.tier == HapticTier.BASIC) {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                    ),
+                ) {
+                    Text(
+                        text     = "This device's haptic hardware is basic. Vibrations will be on/off only.",
+                        modifier = Modifier.padding(12.dp),
+                    )
+                }
+            }
+
+            HorizontalDivider()
+
+            val diagColor = MaterialTheme.colorScheme.onSurfaceVariant
+            val diagStyle = MaterialTheme.typography.bodySmall
+            Text(
+                text  = when (clockOffsetMs) {
+                    null -> "Clock sync:  pending"
+                    else -> "Clock sync:  $clockOffsetMs ms offset"
+                },
+                style = diagStyle, color = diagColor,
+            )
+            Text(
+                text  = when (eventCount) {
+                    null -> "Timeline:  none loaded"
+                    else -> "Timeline:  $eventCount events"
+                },
+                style = diagStyle, color = diagColor,
+            )
+            Text(
+                text  = when (lastSyncMediaT) {
+                    null -> "UDP sync:  none received"
+                    else -> "UDP sync:  last media_t = ${"%.2f".format(lastSyncMediaT)} s"
+                },
+                style = diagStyle, color = diagColor,
+            )
+
+            HorizontalDivider()
+
+            Text("Haptic strength:  ${"%.2f".format(strengthScale)}×", style = MaterialTheme.typography.titleSmall)
+            Slider(
+                value         = strengthScale,
+                onValueChange = onStrengthScaleChange,
+                valueRange    = 0.5f..1.5f,
+                modifier      = Modifier.fillMaxWidth(),
+            )
+
+            Text("Min intensity:  ${"%.2f".format(minIntensity)}", style = MaterialTheme.typography.titleSmall)
+            Slider(
+                value         = minIntensity,
+                onValueChange = onMinIntensityChange,
+                valueRange    = 0f..0.5f,
+                modifier      = Modifier.fillMaxWidth(),
+            )
+
+            HorizontalDivider()
+
+            Text("Test vibration (intensity 0.8):", style = MaterialTheme.typography.titleSmall)
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                modifier              = Modifier.fillMaxWidth(),
+            ) {
+                Button(
+                    onClick  = { onTestVibration("strike") },
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text("Strike")
+                }
+                OutlinedButton(
+                    onClick  = { onTestVibration("bounce") },
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text("Bounce")
+                }
+            }
+
             Button(
-                onClick = { onTestVibration("strike") },
-                modifier = Modifier.weight(1f),
+                onClick  = onTestTimeline,
+                modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("Strike")
+                Text("Test Timeline (6 events, ~3 s)")
             }
-            OutlinedButton(
-                onClick = { onTestVibration("bounce") },
-                modifier = Modifier.weight(1f),
-            ) {
-                Text("Bounce")
-            }
-        }
 
-        Button(
-            onClick = onTestTimeline,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text("Test Timeline (6 events, ~3 s)")
+            Spacer(Modifier.height(24.dp))
         }
     }
 }
