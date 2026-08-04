@@ -489,32 +489,19 @@ fun SettingsScreen(
 
             HorizontalDivider()
 
-            val amplitudeEnabled = capabilities.hasAmplitudeControl
-            val disabledLabelColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
-
-            Text(
-                text  = "Haptic strength:  ${"%.2f".format(strengthScale)}×",
-                style = MaterialTheme.typography.titleSmall,
-                color = if (amplitudeEnabled) Color.Unspecified else disabledLabelColor,
-            )
+            Text("Haptic strength:  ${"%.2f".format(strengthScale)}×", style = MaterialTheme.typography.titleSmall)
             Slider(
                 value         = strengthScale,
                 onValueChange = onStrengthScaleChange,
                 valueRange    = 0.5f..1.5f,
-                enabled       = amplitudeEnabled,
                 modifier      = Modifier.fillMaxWidth(),
             )
 
-            Text(
-                text  = "Min intensity:  ${"%.2f".format(minIntensity)}",
-                style = MaterialTheme.typography.titleSmall,
-                color = if (amplitudeEnabled) Color.Unspecified else disabledLabelColor,
-            )
+            Text("Min intensity:  ${"%.2f".format(minIntensity)}", style = MaterialTheme.typography.titleSmall)
             Slider(
                 value         = minIntensity,
                 onValueChange = onMinIntensityChange,
                 valueRange    = 0f..0.5f,
-                enabled       = amplitudeEnabled,
                 modifier      = Modifier.fillMaxWidth(),
             )
 
