@@ -340,7 +340,7 @@ fun MainScreen(
             verticalArrangement = Arrangement.Center,
         ) {
             Surface(
-                modifier = Modifier.size(120.dp),
+                modifier = Modifier.size(240.dp),
                 shape    = CircleShape,
                 color    = Color(0xFF0D1628),
             ) {
