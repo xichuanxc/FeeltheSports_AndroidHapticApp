@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -648,13 +649,74 @@ fun AboutScreen(onBack: () -> Unit) {
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .padding(24.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+                .padding(horizontal = 24.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Text("FeeltheSports", style = MaterialTheme.typography.headlineMedium)
-            Text("Haptic Feedback Application", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(8.dp))
+
+            // University logo
+            androidx.compose.foundation.Image(
+                painter            = painterResource(R.drawable.university_of_waikato_logo),
+                contentDescription = "University of Waikato",
+                contentScale       = ContentScale.Fit,
+                modifier           = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp),
+            )
+
             HorizontalDivider()
-            // Detailed information to be added
+
+            // App identity
+            Text("FeeltheSports", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+            Text(
+                "Real-time haptic feedback for tennis match viewing",
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            HorizontalDivider()
+
+            // People
+            AboutRow(label = "Developed by",  value = "Chuan Xi")
+            AboutRow(label = "Supervised by", value = "Assoc. Prof. David Nichols")
+            AboutRow(label = "",              value = "Dr. Jemma König")
+
+            HorizontalDivider()
+
+            // Institution
+            AboutRow(label = "Institution", value = "University of Waikato\nTe Whare Wānanga o Waikato")
+            AboutRow(label = "School",      value = "School of Computing and\nMathematical Sciences")
+
+            HorizontalDivider()
+
+            // Build info
+            AboutRow(label = "Version",    value = "1.0")
+            AboutRow(label = "Build date", value = "4 Aug 2026")
+            AboutRow(label = "Contact",    value = "xichuanxc@gmail.com")
+
+            Spacer(Modifier.height(24.dp))
         }
+    }
+}
+
+@Composable
+private fun AboutRow(label: String, value: String) {
+    Row(
+        modifier              = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text(
+            text     = label,
+            style    = MaterialTheme.typography.bodyMedium,
+            color    = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.width(100.dp),
+        )
+        Text(
+            text  = value,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Medium,
+            modifier = Modifier.weight(1f),
+        )
     }
 }
