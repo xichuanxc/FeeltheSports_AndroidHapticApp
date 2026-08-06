@@ -2,6 +2,7 @@ package com.feelthesports.hapticactuator
 
 import android.app.NotificationManager
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings as AndroidSettings
@@ -190,7 +191,7 @@ class MainActivity : ComponentActivity() {
                         },
                         onBack = { showSettings = false },
                     )
-                    showAbout -> AboutScreen(onBack = { showAbout = false })
+                    showAbout -> AboutScreen(capabilities = capabilities, onBack = { showAbout = false })
                     else -> Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                         MainScreen(
                             connectionStatus = connectionStatus,
@@ -628,7 +629,7 @@ fun SettingsScreen(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AboutScreen(onBack: () -> Unit) {
+fun AboutScreen(capabilities: HapticCapabilities, onBack: () -> Unit) {
     BackHandler(onBack = onBack)
     Scaffold(
         topBar = {
@@ -656,7 +657,17 @@ fun AboutScreen(onBack: () -> Unit) {
             Spacer(Modifier.height(8.dp))
 
             // App identity
-            Text("FeeltheSports", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+            Row(
+                verticalAlignment     = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                androidx.compose.foundation.Image(
+                    painter            = painterResource(R.drawable.haptic_icon),
+                    contentDescription = null,
+                    modifier           = Modifier.size(48.dp),
+                )
+                Text("FeeltheSports", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+            }
             Text(
                 "Real-time haptic feedback for tennis match viewing",
                 style = MaterialTheme.typography.bodyLarge,
@@ -679,9 +690,24 @@ fun AboutScreen(onBack: () -> Unit) {
             HorizontalDivider()
 
             // Build info
-            AboutRow(label = "Version",    value = BuildConfig.VERSION_NAME)
-            AboutRow(label = "Build date", value = "4 Aug 2026")
-            AboutRow(label = "Contact",    value = "xichuanxc@gmail.com")
+            AboutRow(label = "Version",  value = "${BuildConfig.VERSION_NAME} · 5 Aug 2026")
+            AboutRow(label = "Contact", value = "xichuanxc@gmail.com")
+
+            HorizontalDivider()
+
+            // Device info
+            AboutRow(
+                label = "Android",
+                value = "API ${Build.VERSION.SDK_INT} (Android ${Build.VERSION.RELEASE})",
+            )
+            AboutRow(
+                label = "Haptics",
+                value = when (capabilities.tier) {
+                    HapticTier.COMPOSITION -> "Composition (Tier 1)"
+                    HapticTier.AMPLITUDE   -> "Amplitude (Tier 2)"
+                    HapticTier.BASIC       -> "Basic (Tier 3)"
+                },
+            )
 
             HorizontalDivider()
 
